@@ -57,6 +57,7 @@ set(corelib_test_sources
 	test_geodeticcoords.cpp             #GeodeticCoords.h
 	test_compression.cpp                #Compression.h
 	test_odometry.cpp                   #Odometry.h
+	test_odometry_vio.cpp               #odometry/OdometryVIO.h
 	test_dbdriver.cpp                   #DBDriver.h
 	test_dbdriversqlite3.cpp            #DBDriverSqlite3.h
 	test_signature.cpp                  #Signature.h
