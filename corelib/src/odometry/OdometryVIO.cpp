@@ -28,7 +28,10 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include "rtabmap/core/odometry/OdometryVIO.h"
 #include "rtabmap/core/odometry/VIOFrontend.h"
 #include "rtabmap/core/OdometryInfo.h"
+#include "rtabmap/core/util3d_motion_estimation.h"
 #include "rtabmap/utilite/ULogger.h"
+#include <algorithm>
+#include <deque>
 
 #ifdef RTABMAP_GTSAM
 #include <gtsam/navigation/CombinedImuFactor.h>
@@ -54,8 +57,17 @@ struct OdometryVIO::Impl
 	double lastImuStamp = 0.0;
 	Eigen::Vector3d lastAcc = Eigen::Vector3d::Zero();
 	Eigen::Vector3d lastOmega = Eigen::Vector3d::Zero();
-	Eigen::Vector3d accSum = Eigen::Vector3d::Zero();
-	int accSamples = 0;
+	// Initialization: last IMU samples (stamp, acc, gyro)
+	std::deque<std::pair<double, std::pair<Eigen::Vector3d, Eigen::Vector3d> > > initSamples;
+	// Stereo images before initialization: stamp, track positions and 3D points (base frame)
+	std::deque<std::pair<double, std::vector<VIOFrontend::Track> > > initImages;
+	StereoCameraModel initModel;
+	std::pair<double, double> initMotionStamps; // images of the last camera motion computed
+	double initMotion = -1.0;
+	double initMaxAccStd = 0.0;
+	double initMaxGyroStd = 0.0;
+	double initMaxGyroBias = 0.0;
+	double initMaxMotion = 0.0;
 	Transform imuLocalTransform;     // base -> imu
 	Transform imuLocalTransformInv;  // imu -> base
 	Transform previousPoseInv;       // inverse of last base pose returned
@@ -75,8 +87,10 @@ struct OdometryVIO::Impl
 #endif
 		initialized = false;
 		lastImuStamp = 0.0;
-		accSum.setZero();
-		accSamples = 0;
+		initSamples.clear();
+		initImages.clear();
+		initMotionStamps = std::make_pair(0.0, 0.0);
+		initMotion = -1.0;
 		imuLocalTransform.setNull();
 		imuLocalTransformInv.setNull();
 		previousPoseInv.setNull();
@@ -108,6 +122,14 @@ OdometryVIO::OdometryVIO(const ParametersMap & parameters) :
 	impl_->keyframeInterval = Parameters::defaultOdomVIOKeyframeInterval();
 	Parameters::parse(parameters, Parameters::kOdomVIOKeyframeInterval(), impl_->keyframeInterval);
 	UASSERT(impl_->keyframeInterval >= 0.0);
+	impl_->initMaxAccStd = Parameters::defaultOdomVIOInitMaxAccStd();
+	impl_->initMaxGyroStd = Parameters::defaultOdomVIOInitMaxGyroStd();
+	impl_->initMaxGyroBias = Parameters::defaultOdomVIOInitMaxGyroBias();
+	impl_->initMaxMotion = Parameters::defaultOdomVIOInitMaxMotion();
+	Parameters::parse(parameters, Parameters::kOdomVIOInitMaxGyroBias(), impl_->initMaxGyroBias);
+	Parameters::parse(parameters, Parameters::kOdomVIOInitMaxAccStd(), impl_->initMaxAccStd);
+	Parameters::parse(parameters, Parameters::kOdomVIOInitMaxGyroStd(), impl_->initMaxGyroStd);
+	Parameters::parse(parameters, Parameters::kOdomVIOInitMaxMotion(), impl_->initMaxMotion);
 	Parameters::parse(parameters, Parameters::kOdomVIOVisualOnly(), visualOnly_);
 #ifdef RTABMAP_GTSAM
 	double accNoise = Parameters::defaultOdomVIOAccNoise();
@@ -151,6 +173,40 @@ void OdometryVIO::reset(const Transform & initialPose)
 }
 
 namespace {
+
+// Standard deviation (RMS distance to the mean) of 3D samples
+double stdDev(const std::vector<Eigen::Vector3d> & v, Eigen::Vector3d & mean)
+{
+	mean.setZero();
+	for(size_t i=0; i<v.size(); ++i) mean += v[i];
+	mean /= (double)v.size();
+	double sum = 0.0;
+	for(size_t i=0; i<v.size(); ++i) sum += (v[i]-mean).squaredNorm();
+	return std::sqrt(sum / (double)v.size());
+}
+
+// Camera translation (m) between two images of the same tracks (PnP), -1 if it cannot be estimated
+double cameraMotion(
+		const std::vector<VIOFrontend::Track> & from,
+		const std::vector<VIOFrontend::Track> & to,
+		const CameraModel & model)
+{
+	std::map<int, cv::Point3f> words3;
+	std::map<int, cv::KeyPoint> words2;
+	for(size_t i=0; i<from.size(); ++i)
+	{
+		if(from[i].hasDepth())
+		{
+			words3.insert(std::make_pair(from[i].id, from[i].point));
+		}
+	}
+	for(size_t i=0; i<to.size(); ++i)
+	{
+		words2.insert(std::make_pair(to[i].id, cv::KeyPoint(to[i].left, 1.0f)));
+	}
+	Transform motion = util3d::estimateMotion3DTo2D(words3, words2, model, 10);
+	return motion.isNull() ? -1.0 : (double)motion.getNorm();
+}
 
 bool hasStereo(const SensorData & data)
 {
@@ -245,22 +301,75 @@ Transform OdometryVIO::computeTransform(
 
 		if(!d.initialized)
 		{
-			// Static initialization: the mean specific force points up (opposite to gravity).
-			d.accSum += acc;
-			++d.accSamples;
-			if(d.accSamples >= initImuSamples_)
+			// Static initialization: wait for a window of OdomVIO/InitImuSamples
+			// samples where the IMU is still (low variance) and, with stereo
+			// images, the image does not move either (an IMU cannot tell
+			// constant velocity from no motion). The mean specific force then
+			// points up and the mean angular velocity is the gyroscope bias.
+			d.initSamples.push_back(std::make_pair(data.stamp(), std::make_pair(acc, omega)));
+			while((int)d.initSamples.size() > initImuSamples_)
 			{
-				Eigen::Vector3d up = (d.accSum / d.accSamples).normalized();
-				gtsam::Rot3 R_wi(Eigen::Quaterniond::FromTwoVectors(up, Eigen::Vector3d::UnitZ()));
-				// Gravity gives roll and pitch only: start with the base frame (not the IMU) at yaw 0
-				Transform baseRotation = Transform::fromEigen4d(gtsam::Pose3(R_wi, gtsam::Point3(0,0,0)).matrix()) * d.imuLocalTransformInv.rotation();
-				R_wi = gtsam::Rot3::Rz(-baseRotation.theta()) * R_wi;
-				d.state = gtsam::NavState(R_wi, gtsam::Point3(0,0,0), gtsam::Velocity3(0,0,0));
-				d.bias = gtsam::imuBias::ConstantBias();
-				d.preintegrated.reset(new gtsam::PreintegratedCombinedMeasurements(d.params, d.bias));
-				d.initialized = true;
-				UINFO("VIO initialized with gravity from %d IMU samples (roll=%f pitch=%f)",
-						d.accSamples, R_wi.roll(), R_wi.pitch());
+				d.initSamples.pop_front();
+			}
+			if((int)d.initSamples.size() == initImuSamples_)
+			{
+				std::vector<Eigen::Vector3d> accs(d.initSamples.size()), gyros(d.initSamples.size());
+				for(size_t i=0; i<d.initSamples.size(); ++i)
+				{
+					accs[i] = d.initSamples[i].second.first;
+					gyros[i] = d.initSamples[i].second.second;
+				}
+				Eigen::Vector3d accMean, gyroMean;
+				double accStd = stdDev(accs, accMean);
+				double gyroStd = stdDev(gyros, gyroMean);
+				// A constant rotation also has a low variance: the mean angular velocity must look like a bias
+				bool imuStill = accStd <= d.initMaxAccStd && gyroStd <= d.initMaxGyroStd && gyroMean.norm() <= d.initMaxGyroBias;
+				// With stereo images, the camera must not have moved since the start of the window
+				bool imageStill = true;
+				if(imuStill && !d.initImages.empty())
+				{
+					std::deque<std::pair<double, std::vector<VIOFrontend::Track> > >::const_iterator first = d.initImages.begin();
+					while(first != d.initImages.end() && first->first < d.initSamples.front().first)
+					{
+						++first;
+					}
+					double motion = -1.0;
+					if(first != d.initImages.end())
+					{
+						std::pair<double, double> stamps(first->first, d.initImages.back().first);
+						if(stamps != d.initMotionStamps)
+						{
+							d.initMotion = cameraMotion(first->second, d.initImages.back().second, d.initModel.left());
+							d.initMotionStamps = stamps;
+						}
+						motion = d.initMotion;
+					}
+					imageStill = motion >= 0.0 && motion <= d.initMaxMotion &&
+							d.initImages.front().first < d.initSamples.front().first; // images cover the window
+				}
+				if(imuStill && imageStill)
+				{
+					Eigen::Vector3d up = accMean.normalized();
+					gtsam::Rot3 R_wi(Eigen::Quaterniond::FromTwoVectors(up, Eigen::Vector3d::UnitZ()));
+					// Gravity gives roll and pitch only: start with the base frame (not the IMU) at yaw 0
+					Transform baseRotation = Transform::fromEigen4d(gtsam::Pose3(R_wi, gtsam::Point3(0,0,0)).matrix()) * d.imuLocalTransformInv.rotation();
+					R_wi = gtsam::Rot3::Rz(-baseRotation.theta()) * R_wi;
+					d.state = gtsam::NavState(R_wi, gtsam::Point3(0,0,0), gtsam::Velocity3(0,0,0));
+					d.bias = gtsam::imuBias::ConstantBias(gtsam::Vector3(0,0,0), gyroMean);
+					d.preintegrated.reset(new gtsam::PreintegratedCombinedMeasurements(d.params, d.bias));
+					d.initialized = true;
+					d.initSamples.clear();
+					d.initImages.clear();
+					UINFO("VIO initialized from %d static IMU samples (acc std=%f, gyro std=%f): "
+							"roll=%f pitch=%f, gyro bias=(%f,%f,%f)",
+							initImuSamples_, accStd, gyroStd, R_wi.roll(), R_wi.pitch(),
+							gyroMean[0], gyroMean[1], gyroMean[2]);
+				}
+				else
+				{
+					UDEBUG("Waiting for a static window to initialize VIO (acc std=%f/%f, gyro std=%f/%f, gyro mean=%f/%f, image still=%d (-1: not checked))",
+							accStd, d.initMaxAccStd, gyroStd, d.initMaxGyroStd, gyroMean.norm(), d.initMaxGyroBias, imuStill?(imageStill?1:0):-1);
+				}
 			}
 		}
 		else
@@ -288,8 +397,22 @@ Transform OdometryVIO::computeTransform(
 	{
 		if(!d.initialized)
 		{
-			UWARN("VIO not initialized yet (%d/%d IMU samples received), waiting for IMU data...",
-					d.accSamples, initImuSamples_);
+			// Track the stereo images to know whether the camera is still
+			if(hasStereo(data))
+			{
+				d.frontend->process(data.imageRaw(), data.rightRaw(), data.stereoCameraModels()[0]);
+				fillFrontendInfo(*d.frontend, info);
+				d.initModel = data.stereoCameraModels()[0];
+				d.initImages.push_back(std::make_pair(data.stamp(), d.frontend->tracks()));
+				// Keep one image older than the IMU window (and a bounded history without IMU)
+				while(d.initImages.size() > 2 &&
+					  ((!d.initSamples.empty() && d.initImages[1].first <= d.initSamples.front().first) || d.initImages.size() > 100))
+				{
+					d.initImages.pop_front();
+				}
+			}
+			UWARN("VIO not initialized yet, waiting for the sensor to be static (%d/%d IMU samples)...",
+					(int)d.initSamples.size(), initImuSamples_);
 			return t;
 		}
 

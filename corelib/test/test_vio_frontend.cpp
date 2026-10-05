@@ -127,12 +127,34 @@ void renderStereo(const Transform & basePose, cv::Mat & left, cv::Mat & right)
 	right = renderView(rightPose);
 }
 
-// Smooth trajectory in the room, 1 m/s forward with lateral, vertical and angular oscillations
-Transform groundTruth(double t)
+// Pose in double precision (same convention as Transform(x,y,z,roll,pitch,yaw)).
+// Finite differences of float Transforms would add ~0.2 m/s^2 of noise to the synthetic IMU.
+Eigen::Isometry3d poseD(double x, double y, double z, double roll, double pitch, double yaw)
 {
-	return Transform(
+	Eigen::Isometry3d T = Eigen::Isometry3d::Identity();
+	T.translation() = Eigen::Vector3d(x, y, z);
+	T.linear() = (Eigen::AngleAxisd(yaw, Eigen::Vector3d::UnitZ()) *
+			Eigen::AngleAxisd(pitch, Eigen::Vector3d::UnitY()) *
+			Eigen::AngleAxisd(roll, Eigen::Vector3d::UnitX())).toRotationMatrix();
+	return T;
+}
+
+Transform toTransform(const Eigen::Isometry3d & T)
+{
+	return Transform::fromEigen4d(T.matrix());
+}
+
+// Smooth trajectory in the room, 1 m/s forward with lateral, vertical and angular oscillations
+Eigen::Isometry3d groundTruthD(double t)
+{
+	return poseD(
 			-2.0 + 1.0*t, 0.3*std::sin(1.5*t), 1.5 + 0.1*std::sin(2.0*t),
 			0.0, 0.05*std::sin(3.0*t), 0.3*std::sin(t));
+}
+
+Transform groundTruth(double t)
+{
+	return toTransform(groundTruthD(t));
 }
 
 // Ground truth 3D point (base frame) seen at a left image pixel
@@ -375,18 +397,25 @@ double warp(double t)
 	return t <= 0.0 ? 0.0 : t - (1.0 - std::exp(-k*t)) / k;
 }
 
-Transform groundTruthVio(double t)
+Eigen::Isometry3d groundTruthVioD(double t)
 {
-	return groundTruth(warp(t));
+	return groundTruthD(warp(t));
 }
 
-// Exact IMU measurements (in the IMU frame) of the ground truth trajectory, by finite differences
-void imuAt(double t, cv::Vec3d & gyro, cv::Vec3d & acc)
+Transform groundTruthVio(double t)
+{
+	return toTransform(groundTruthVioD(t));
+}
+
+// Exact IMU measurements (in the IMU frame) of a base trajectory, by finite differences
+void imuOf(const std::function<Eigen::Isometry3d(double)> & trajectory, const Transform & imuLocal,
+		double t, cv::Vec3d & gyro, cv::Vec3d & acc)
 {
 	const double h = 1e-3;
-	Eigen::Matrix4d T0 = (groundTruthVio(t-h) * kImuLocal).toEigen4d();
-	Eigen::Matrix4d T1 = (groundTruthVio(t) * kImuLocal).toEigen4d();
-	Eigen::Matrix4d T2 = (groundTruthVio(t+h) * kImuLocal).toEigen4d();
+	const Eigen::Isometry3d L(imuLocal.toEigen4d());
+	Eigen::Matrix4d T0 = (trajectory(t-h) * L).matrix();
+	Eigen::Matrix4d T1 = (trajectory(t) * L).matrix();
+	Eigen::Matrix4d T2 = (trajectory(t+h) * L).matrix();
 	Eigen::Matrix3d R1 = T1.block<3,3>(0,0);
 	Eigen::AngleAxisd aa(T0.block<3,3>(0,0).transpose() * T2.block<3,3>(0,0));
 	Eigen::Vector3d w = aa.angle() * aa.axis() / (2.0*h);
@@ -394,6 +423,11 @@ void imuAt(double t, cv::Vec3d & gyro, cv::Vec3d & acc)
 	Eigen::Vector3d f = R1.transpose() * (a + Eigen::Vector3d(0, 0, 9.81));
 	gyro = cv::Vec3d(w[0], w[1], w[2]);
 	acc = cv::Vec3d(f[0], f[1], f[2]);
+}
+
+void imuAt(double t, cv::Vec3d & gyro, cv::Vec3d & acc)
+{
+	imuOf(groundTruthVioD, kImuLocal, t, gyro, acc);
 }
 
 // Rendered stereo frames of the visual-inertial sequence, shared by the tests
@@ -500,6 +534,7 @@ VioRunResult runVio(Odometry & odom, const VioRunOptions & options)
 ParametersMap vioParameters()
 {
 	ParametersMap parameters;
+	parameters.insert(ParametersPair(Parameters::kOdomVIOInitImuSamples(), "40")); // 0.2 s static window
 	parameters.insert(ParametersPair(Parameters::kOdomStrategy(), uNumber2Str((int)Odometry::kTypeVIO)));
 	parameters.insert(ParametersPair(Parameters::kOdomFilteringStrategy(), "0"));
 	parameters.insert(ParametersPair(Parameters::kOdomGuessMotion(), "false"));
@@ -647,9 +682,10 @@ TEST(VIOBackendTest, FollowsGroundTruthWithIdealMeasurements)
 	};
 	std::function<gtsam::NavState(double)> stateAt = [&](double t) {
 		const double h = 1e-4;
-		Eigen::Matrix4d T0 = (groundTruthVio(t-h) * kImuLocal).toEigen4d();
-		Eigen::Matrix4d T1 = (groundTruthVio(t) * kImuLocal).toEigen4d();
-		Eigen::Matrix4d T2 = (groundTruthVio(t+h) * kImuLocal).toEigen4d();
+		const Eigen::Isometry3d L(kImuLocal.toEigen4d());
+		Eigen::Matrix4d T0 = (groundTruthVioD(t-h) * L).matrix();
+		Eigen::Matrix4d T1 = (groundTruthVioD(t) * L).matrix();
+		Eigen::Matrix4d T2 = (groundTruthVioD(t+h) * L).matrix();
 		return gtsam::NavState(gtsam::Pose3(T1), gtsam::Vector3((T2.block<3,1>(0,3)-T0.block<3,1>(0,3))/(2*h)));
 	};
 
@@ -691,3 +727,71 @@ TEST(VIOBackendTest, FollowsGroundTruthWithIdealMeasurements)
 	EXPECT_EQ(backend.stats().keyframes, 15); // keyframes newer than 1.5 s at 10 Hz
 }
 #endif
+
+namespace {
+
+// Moving at a constant 0.5 m/s along x until t=0 (the IMU then reads the
+// same as at rest), decelerating to a stop at t=0.5, then static.
+Eigen::Isometry3d constantVelocityThenStopD(double t)
+{
+	double x = t < 0.0 ? 0.5*t : t < 0.5 ? 0.5*t - 0.5*t*t : 0.125;
+	return poseD(-2.0 + x, 0.0, 1.5, 0, 0, 0);
+}
+
+// Returns the time of the first pose, or 1e9 if none. maxDrift: largest
+// distance of the poses from the first one (the sensor is static after init).
+double firstPoseTime(Odometry & odom, double * maxDrift)
+{
+	const double start = -1.0, end = 1.5;
+	const int steps = (int)std::lround((end - start) * kImuRateVio);
+	const int imuPerImage = (int)std::lround(kImuRateVio / kCameraRateVio);
+	double first = 1e9;
+	*maxDrift = 0.0;
+	for(int i=0; i<=steps; ++i)
+	{
+		double t = start + i / kImuRateVio;
+		double stamp = 1000.0 + i / kImuRateVio;
+		cv::Vec3d gyro, acc;
+		imuOf(constantVelocityThenStopD, Transform::getIdentity(), t, gyro, acc);
+		SensorData imu;
+		imu.setStamp(stamp);
+		imu.setIMU(IMU(gyro, cv::Mat::eye(3,3,CV_64FC1), acc, cv::Mat::eye(3,3,CV_64FC1), Transform::getIdentity()));
+		odom.process(imu);
+		if(i % imuPerImage == 0)
+		{
+			cv::Mat left, right;
+			renderStereo(toTransform(constantVelocityThenStopD(t)), left, right);
+			SensorData data(left, right, stereoModel(), i/imuPerImage+1, stamp);
+			if(!odom.process(data).isNull())
+			{
+				first = std::min(first, t);
+				*maxDrift = std::max(*maxDrift, (double)odom.getPose().getNorm());
+			}
+		}
+	}
+	return first;
+}
+
+} // namespace
+
+TEST(OdometryVIOInitTest, ConstantVelocityIsNotTakenAsStatic)
+{
+	if(!backendAvailable()) GTEST_SKIP() << "RTAB-Map built without gtsam_unstable";
+
+	// The image motion prevents initializing while moving at constant velocity
+	std::unique_ptr<Odometry> odom(Odometry::create(vioParameters()));
+	double drift = 0.0;
+	double first = firstPoseTime(*odom, &drift);
+	std::cout << "First pose at t=" << first << " s (stop at 0.5 s), drift " << drift << " m" << std::endl;
+	EXPECT_GT(first, 0.5); // a static window starts after the stop
+	EXPECT_LT(first, 1.0);
+	EXPECT_LT(drift, 0.002);
+
+	// Without the image check, the IMU alone initializes during the motion
+	ParametersMap parameters = vioParameters();
+	parameters[Parameters::kOdomVIOInitMaxMotion()] = "1000";
+	std::unique_ptr<Odometry> imuOnlyCheck(Odometry::create(parameters));
+	double imuOnlyFirst = firstPoseTime(*imuOnlyCheck, &drift);
+	std::cout << "Without the image check: first pose at t=" << imuOnlyFirst << " s" << std::endl;
+	EXPECT_LT(imuOnlyFirst, 0.0);
+}

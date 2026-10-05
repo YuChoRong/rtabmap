@@ -37,9 +37,11 @@ namespace rtabmap {
  * Visual-inertial odometry built on GTSAM.
  *
  * IMU measurements are pre-integrated (gtsam::PreintegratedCombinedMeasurements).
- * The initial orientation is aligned with gravity from the average of the
- * first OdomVIO/InitImuSamples accelerometer samples, so the sensor must be
- * static at start.
+ * Initialization waits for a static window of OdomVIO/InitImuSamples IMU
+ * samples (low accelerometer and gyroscope variance, small mean angular
+ * velocity and, with stereo images, no camera motion over the window). Its
+ * mean acceleration gives the gravity direction (roll and pitch) and its mean
+ * angular velocity the initial gyroscope bias.
  *
  * Stereo frames are tracked by VIOFrontend. When RTAB-Map is built with
  * gtsam_unstable, a keyframe is taken every OdomVIO/KeyframeInterval and the
