@@ -152,7 +152,7 @@ Transform OdometryVIO::computeTransform(
 				Eigen::Vector3d up = (d.accSum / d.accSamples).normalized();
 				gtsam::Rot3 R_wi(Eigen::Quaterniond::FromTwoVectors(up, Eigen::Vector3d::UnitZ()));
 				// Gravity gives roll and pitch only: start with the base frame (not the IMU) at yaw 0
-				Transform baseRotation = Transform::fromEigen4d(gtsam::Pose3(R_wi, gtsam::Point3()).matrix()) * d.imuLocalTransformInv.rotation();
+				Transform baseRotation = Transform::fromEigen4d(gtsam::Pose3(R_wi, gtsam::Point3(0,0,0)).matrix()) * d.imuLocalTransformInv.rotation();
 				R_wi = gtsam::Rot3::Rz(-baseRotation.theta()) * R_wi;
 				d.state = gtsam::NavState(R_wi, gtsam::Point3(0,0,0), gtsam::Velocity3(0,0,0));
 				d.bias = gtsam::imuBias::ConstantBias();
