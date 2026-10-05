@@ -355,17 +355,29 @@ void VIOFrontend::computeDepth(const cv::Mat & left, const cv::Mat & right, cons
 	std::vector<cv::Point2f> rightPts = stereo_->computeCorrespondences(left, right, leftPts, status);
 	if(stereoBackCheck_ > 0.0 && rightPts.size() == leftPts.size())
 	{
+		const cv::Size winSize(flowWinSize_, flowWinSize_);
+		const cv::TermCriteria criteria(cv::TermCriteria::COUNT+cv::TermCriteria::EPS, 30, 0.01);
+		std::vector<float> err;
+		// Sub-pixel refinement of the matches (e.g., integer disparities of block matching)
+		std::vector<cv::Point2f> refined = rightPts;
+		std::vector<unsigned char> refinedStatus;
+		cv::calcOpticalFlowPyrLK(left, right, leftPts, refined, refinedStatus, err,
+				winSize, 0, criteria, cv::OPTFLOW_USE_INITIAL_FLOW);
 		// Left-right consistency: track the right correspondences back to the left image
 		std::vector<cv::Point2f> backPts = leftPts;
 		std::vector<unsigned char> backStatus;
-		std::vector<float> err;
-		cv::calcOpticalFlowPyrLK(right, left, rightPts, backPts, backStatus, err,
-				cv::Size(flowWinSize_, flowWinSize_), 1,
-				cv::TermCriteria(cv::TermCriteria::COUNT+cv::TermCriteria::EPS, 30, 0.01),
-				cv::OPTFLOW_USE_INITIAL_FLOW);
+		cv::calcOpticalFlowPyrLK(right, left, refined, backPts, backStatus, err,
+				winSize, 0, criteria, cv::OPTFLOW_USE_INITIAL_FLOW);
 		for(size_t i=0; i<status.size(); ++i)
 		{
-			if(status[i] && (!backStatus[i] || cv::norm(backPts[i] - leftPts[i]) > stereoBackCheck_))
+			if(status[i] && refinedStatus[i] && backStatus[i] &&
+			   std::fabs(refined[i].y - leftPts[i].y) <= stereoBackCheck_ && // rectified images
+			   cv::norm(refined[i] - rightPts[i]) <= 2.0 * stereoBackCheck_ &&
+			   cv::norm(backPts[i] - leftPts[i]) <= stereoBackCheck_)
+			{
+				rightPts[i] = refined[i];
+			}
+			else
 			{
 				status[i] = 0;
 			}

@@ -727,22 +727,22 @@ class RTABMAP_CORE_EXPORT Parameters
     RTABMAP_PARAM(OdomVIO, InitMaxGyroBias,  double, 0.1,       "Maximum norm (rad/s) of the mean angular velocity of a static window (the expected gyroscope bias range), so that a constant rotation is not taken as static.");
     RTABMAP_PARAM(OdomVIO, InitMaxMotion,    double, 0.005,     "With stereo images, maximum camera translation (m) over a static window, estimated by PnP between its first and last images (an IMU cannot tell constant velocity from no motion).");
     RTABMAP_PARAM(OdomVIO, VisualOnly,       bool,   false,     "Ignore IMU data and output the stereo visual odometry of the front-end (PnP between consecutive frames). Used to validate the visual front-end.");
-    RTABMAP_PARAM(OdomVIO, MaxFeatures,      int,    200,       "Maximum number of tracked features. New GFTT corners are detected when tracks are lost.");
-    RTABMAP_PARAM(OdomVIO, MinFeatureDistance, double, 20.0,    "Minimum distance (pixels) between tracked features.");
+    RTABMAP_PARAM(OdomVIO, MaxFeatures,      int,    300,       "Maximum number of tracked features. New GFTT corners are detected when tracks are lost.");
+    RTABMAP_PARAM(OdomVIO, MinFeatureDistance, double, 15.0,    "Minimum distance (pixels) between tracked features.");
     RTABMAP_PARAM(OdomVIO, FeatureQuality,   double, 0.01,      "GFTT quality level of new corners (relative to the best corner of the image).");
     RTABMAP_PARAM(OdomVIO, FlowWinSize,      int,    21,        "KLT window size (pixels).");
     RTABMAP_PARAM(OdomVIO, FlowMaxLevel,     int,    3,         "KLT maximum pyramid level.");
     RTABMAP_PARAM(OdomVIO, FlowBackCheck,    double, 1.0,       "Maximum distance (pixels) between a feature and its backward KLT track. 0 disables the backward check.");
-    RTABMAP_PARAM(OdomVIO, StereoBackCheck,  double, 1.0,       "Maximum distance (pixels) between a left feature and the KLT track of its right correspondence back to the left image. Rejects wrong stereo matches (e.g., on repetitive textures). 0 disables the check.");
+    RTABMAP_PARAM(OdomVIO, StereoBackCheck,  double, 1.0,       "Stereo matches are refined to sub-pixel by KLT and kept if the refinement moved them less than twice this distance (pixels), if they are on the same row as the left feature within this distance and if the KLT track of the right point back to the left image falls within this distance of the left feature. Rejects wrong stereo matches (e.g., on repetitive textures). 0 disables the refinement and the checks.");
     RTABMAP_PARAM(OdomVIO, FundamentalThreshold, double, 1.0,   "Fundamental matrix RANSAC threshold (pixels) for outlier rejection of all tracks. 0 disables it.");
     RTABMAP_PARAM(OdomVIO, PnPReprojError,   double, 2.0,       "PnP RANSAC reprojection error (pixels).");
     RTABMAP_PARAM(OdomVIO, PnPIterations,    int,    100,       "PnP RANSAC iterations.");
     RTABMAP_PARAM(OdomVIO, MinInliers,       int,    15,        "Minimum PnP inliers to accept a visual motion estimate.");
-    RTABMAP_PARAM(OdomVIO, KeyframeInterval, double, 0.1,       "Minimum time (s) between two keyframes of the back-end. Frames in between output the IMU propagation from the last keyframe.");
-    RTABMAP_PARAM(OdomVIO, WindowSize,       double, 1.5,       "Length (s) of the fixed-lag smoother window. Older keyframes are marginalized.");
+    RTABMAP_PARAM(OdomVIO, KeyframeInterval, double, 0.2,       "Minimum time (s) between two keyframes of the back-end. Frames in between output the IMU propagation from the last keyframe.");
+    RTABMAP_PARAM(OdomVIO, WindowSize,       double, 2.0,       "Length (s) of the fixed-lag smoother window. Older keyframes are marginalized.");
     RTABMAP_PARAM(OdomVIO, PixelNoise,       double, 1.0,       "Standard deviation (pixels) of the stereo observations in the back-end.");
-    RTABMAP_PARAM(OdomVIO, MonoObservations, bool,   true,      "Also add the observations of tracks without stereo depth (left image only) to the back-end, for tracks having at least one stereo observation in the window. Helps when the stereo matching fails (e.g., objects too close).");
-    RTABMAP_PARAM(OdomVIO, BackendIterations, int,   1,         "Extra smoother iterations after each keyframe update.");
+    RTABMAP_PARAM(OdomVIO, MonoObservations, bool,   false,      "Also add the observations of tracks without stereo depth (left image only) to the back-end, for tracks having at least one stereo observation in the window. Helps when the stereo matching fails (e.g., objects too close).");
+    RTABMAP_PARAM(OdomVIO, BackendIterations, int,   3,         "Extra smoother iterations after each keyframe update.");
 
     // Odometry Open3D
     RTABMAP_PARAM(OdomOpen3D, MaxDepth,         float, 3.0,  "Maximum depth.");

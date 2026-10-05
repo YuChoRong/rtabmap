@@ -724,7 +724,8 @@ TEST(VIOBackendTest, FollowsGroundTruthWithIdealMeasurements)
 	EXPECT_LT((backend.state().v() - truth.v()).norm(), 0.005);
 	EXPECT_LT(gtsam::Rot3::Logmap(backend.state().pose().rotation().between(truth.pose().rotation())).norm(), 0.001);
 	EXPECT_LT(backend.bias().vector().norm(), 0.01);
-	EXPECT_EQ(backend.stats().keyframes, 15); // keyframes newer than 1.5 s at 10 Hz
+	// keyframes newer than the window length
+	EXPECT_EQ(backend.stats().keyframes, (int)std::lround(Parameters::defaultOdomVIOWindowSize() / keyframeInterval));
 }
 #endif
 
