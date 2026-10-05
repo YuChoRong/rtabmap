@@ -73,7 +73,8 @@ public:
 		kTypeFLOAM = 11,    /**< FLOAM lidar odometry. */
 		kTypeOpen3D = 12,   /**< Open3D RGB-D odometry. */
 		kTypeCuVSLAM = 13,  /**< cuVSLAM. */
-		kTypeLIOSAM = 14    /**< LIO-SAM. */
+		kTypeLIOSAM = 14,   /**< LIO-SAM. */
+		kTypeVIO = 15       /**< Visual-inertial odometry (GTSAM). */
 	};
 
 	/**
