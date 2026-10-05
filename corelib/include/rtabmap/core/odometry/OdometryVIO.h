@@ -36,15 +36,21 @@ namespace rtabmap {
 /**
  * Visual-inertial odometry built on GTSAM.
  *
- * Current stage: IMU propagation + stereo visual front-end. IMU measurements
- * are pre-integrated (gtsam::PreintegratedCombinedMeasurements) between image
- * frames, and the pose is predicted at each image frame. The initial
- * orientation is aligned with gravity from the average of the first
- * OdomVIO/InitImuSamples accelerometer samples, so the sensor must be static
- * at start. Stereo frames are tracked by VIOFrontend (results in
- * OdometryInfo); with OdomVIO/VisualOnly the output is the front-end's
- * visual odometry instead. The fixed-lag smoother fusing both is added in
- * the next stage.
+ * IMU measurements are pre-integrated (gtsam::PreintegratedCombinedMeasurements).
+ * The initial orientation is aligned with gravity from the average of the
+ * first OdomVIO/InitImuSamples accelerometer samples, so the sensor must be
+ * static at start.
+ *
+ * Stereo frames are tracked by VIOFrontend. When RTAB-Map is built with
+ * gtsam_unstable, a keyframe is taken every OdomVIO/KeyframeInterval and the
+ * IMU factors and stereo tracks are optimized together by VIOBackend, a
+ * GTSAM fixed-lag smoother (tightly coupled, OdomVIO/WindowSize). Frames
+ * between keyframes output the IMU propagation from the last optimized
+ * keyframe. Without stereo images (or without gtsam_unstable), the output
+ * is the IMU propagation only.
+ *
+ * With OdomVIO/VisualOnly, the output is the front-end's stereo visual
+ * odometry and IMU data is ignored.
  */
 class RTABMAP_CORE_EXPORT OdometryVIO : public Odometry
 {

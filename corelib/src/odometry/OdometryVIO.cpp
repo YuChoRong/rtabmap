@@ -35,6 +35,9 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include <gtsam/navigation/NavState.h>
 #include <gtsam/navigation/ImuBias.h>
 #endif
+#ifdef RTABMAP_GTSAM_UNSTABLE
+#include "VIOBackend.h"
+#endif
 
 namespace rtabmap {
 
@@ -49,12 +52,19 @@ struct OdometryVIO::Impl
 #endif
 	bool initialized = false;
 	double lastImuStamp = 0.0;
+	Eigen::Vector3d lastAcc = Eigen::Vector3d::Zero();
+	Eigen::Vector3d lastOmega = Eigen::Vector3d::Zero();
 	Eigen::Vector3d accSum = Eigen::Vector3d::Zero();
 	int accSamples = 0;
 	Transform imuLocalTransform;     // base -> imu
 	Transform imuLocalTransformInv;  // imu -> base
 	Transform previousPoseInv;       // inverse of last base pose returned
 	std::unique_ptr<VIOFrontend> frontend;
+#ifdef RTABMAP_GTSAM_UNSTABLE
+	std::unique_ptr<VIOBackend> backend;
+	bool backendStarted = false; // the back-end has been initialized at least once since clear()
+#endif
+	double keyframeInterval = 0.0;
 
 	void clear()
 	{
@@ -74,6 +84,13 @@ struct OdometryVIO::Impl
 		{
 			frontend->reset();
 		}
+#ifdef RTABMAP_GTSAM_UNSTABLE
+		if(backend)
+		{
+			backend->reset();
+		}
+		backendStarted = false;
+#endif
 	}
 };
 
@@ -85,6 +102,12 @@ OdometryVIO::OdometryVIO(const ParametersMap & parameters) :
 	visualOnly_(Parameters::defaultOdomVIOVisualOnly())
 {
 	impl_->frontend.reset(new VIOFrontend(parameters));
+#ifdef RTABMAP_GTSAM_UNSTABLE
+	impl_->backend.reset(new VIOBackend(parameters));
+#endif
+	impl_->keyframeInterval = Parameters::defaultOdomVIOKeyframeInterval();
+	Parameters::parse(parameters, Parameters::kOdomVIOKeyframeInterval(), impl_->keyframeInterval);
+	UASSERT(impl_->keyframeInterval >= 0.0);
 	Parameters::parse(parameters, Parameters::kOdomVIOVisualOnly(), visualOnly_);
 #ifdef RTABMAP_GTSAM
 	double accNoise = Parameters::defaultOdomVIOAccNoise();
@@ -245,7 +268,8 @@ Transform OdometryVIO::computeTransform(
 			double dt = data.stamp() - d.lastImuStamp;
 			if(dt > 0.0)
 			{
-				d.preintegrated->integrateMeasurement(acc, omega, dt);
+				// Midpoint between the two samples bounding the interval
+				d.preintegrated->integrateMeasurement(0.5*(d.lastAcc+acc), 0.5*(d.lastOmega+omega), dt);
 			}
 			else
 			{
@@ -253,6 +277,8 @@ Transform OdometryVIO::computeTransform(
 			}
 		}
 		d.lastImuStamp = data.stamp();
+		d.lastAcc = acc;
+		d.lastOmega = omega;
 	}
 
 	bool isImageFrame = !data.imageRaw().empty() ||
@@ -268,11 +294,63 @@ Transform OdometryVIO::computeTransform(
 		}
 
 		// Predict at the stamp of the last IMU sample received (IMU is expected
-		// to be fed before the image of the same time).
+		// to be fed before the image of the same time). d.state is the state
+		// where the pre-integration started: the last keyframe with the
+		// back-end, the last image frame otherwise.
 		gtsam::NavState predicted = d.preintegrated->predict(d.state, d.bias);
 		Eigen::Matrix<double, 15, 15> cov = d.preintegrated->preintMeasCov();
+		gtsam::NavState output = predicted;
+		bool restartIntegration = true;
 
-		Transform imuPose = Transform::fromEigen4d(predicted.pose().matrix());
+		if(hasStereo(data))
+		{
+			// The IMU motion initializes KLT
+			Transform motionGuess;
+			if(!d.previousPoseInv.isNull())
+			{
+				motionGuess = d.previousPoseInv * Transform::fromEigen4d(predicted.pose().matrix()) * d.imuLocalTransformInv;
+			}
+			const StereoCameraModel & model = data.stereoCameraModels()[0];
+			d.frontend->process(data.imageRaw(), data.rightRaw(), model, motionGuess);
+			fillFrontendInfo(*d.frontend, info);
+
+#ifdef RTABMAP_GTSAM_UNSTABLE
+			// (1e-6: stamps are large numbers, 1000.1-1000.0 < 0.1)
+			bool keyframe = !d.backend->initialized() ||
+					(data.stamp() > d.backend->lastKeyframeStamp() &&
+					 data.stamp() - d.backend->lastKeyframeStamp() >= d.keyframeInterval - 1e-6);
+			if(keyframe)
+			{
+				bool success;
+				if(!d.backend->initialized())
+				{
+					gtsam::Pose3 imuToCamera((d.imuLocalTransformInv * model.left().localTransform()).toEigen4d());
+					// Static start: zero velocity. After a failure, the velocity is the IMU prediction.
+					double velocitySigma = d.backendStarted ? 1.0 : 0.01;
+					success = d.backend->initialize(data.stamp(), predicted, d.bias, imuToCamera, model,
+							d.frontend->tracks(), velocitySigma);
+					d.backendStarted = true;
+				}
+				else
+				{
+					success = d.backend->addKeyframe(data.stamp(), *d.preintegrated, predicted, d.frontend->tracks());
+				}
+				if(success)
+				{
+					output = d.backend->state();
+					d.bias = d.backend->bias();
+				}
+				// else: keep the IMU prediction, the back-end restarts at the next keyframe
+			}
+			else
+			{
+				// Keep integrating from the last keyframe
+				restartIntegration = false;
+			}
+#endif
+		}
+
+		Transform imuPose = Transform::fromEigen4d(output.pose().matrix());
 		Transform p = imuPose * d.imuLocalTransformInv; // base pose in world
 
 		if(this->getPose().rotation().isIdentity() && d.previousPoseInv.isNull())
@@ -290,15 +368,10 @@ Transform OdometryVIO::computeTransform(
 		t = d.previousPoseInv * p;
 		d.previousPoseInv = p.inverse();
 
-		d.state = predicted;
-		d.preintegrated->resetIntegrationAndSetBias(d.bias);
-
-		// Visual tracking only feeds the info for now: the back-end (next stage)
-		// will use the tracks. The IMU motion initializes KLT.
-		if(hasStereo(data))
+		if(restartIntegration)
 		{
-			d.frontend->process(data.imageRaw(), data.rightRaw(), data.stereoCameraModels()[0], t);
-			fillFrontendInfo(*d.frontend, info);
+			d.state = output;
+			d.preintegrated->resetIntegrationAndSetBias(d.bias);
 		}
 
 		if(info)

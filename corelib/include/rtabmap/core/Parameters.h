@@ -732,6 +732,10 @@ class RTABMAP_CORE_EXPORT Parameters
     RTABMAP_PARAM(OdomVIO, PnPReprojError,   double, 2.0,       "PnP RANSAC reprojection error (pixels).");
     RTABMAP_PARAM(OdomVIO, PnPIterations,    int,    100,       "PnP RANSAC iterations.");
     RTABMAP_PARAM(OdomVIO, MinInliers,       int,    15,        "Minimum PnP inliers to accept a visual motion estimate.");
+    RTABMAP_PARAM(OdomVIO, KeyframeInterval, double, 0.1,       "Minimum time (s) between two keyframes of the back-end. Frames in between output the IMU propagation from the last keyframe.");
+    RTABMAP_PARAM(OdomVIO, WindowSize,       double, 1.5,       "Length (s) of the fixed-lag smoother window. Older keyframes are marginalized.");
+    RTABMAP_PARAM(OdomVIO, PixelNoise,       double, 1.0,       "Standard deviation (pixels) of the stereo observations in the back-end.");
+    RTABMAP_PARAM(OdomVIO, BackendIterations, int,   1,         "Extra smoother iterations after each keyframe update.");
 
     // Odometry Open3D
     RTABMAP_PARAM(OdomOpen3D, MaxDepth,         float, 3.0,  "Maximum depth.");
