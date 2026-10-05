@@ -721,6 +721,17 @@ class RTABMAP_CORE_EXPORT Parameters
     RTABMAP_PARAM(OdomVIO, GyroBiasNoise,    double, 1.9393e-5, "Gyroscope bias random walk (rad/s^2/sqrt(Hz)).");
     RTABMAP_PARAM(OdomVIO, Gravity,          double, 9.81,      "Gravity magnitude (m/s^2).");
     RTABMAP_PARAM(OdomVIO, InitImuSamples,   int,    20,        "Number of IMU samples averaged to estimate the gravity direction at start. The sensor should be static during that time.");
+    RTABMAP_PARAM(OdomVIO, VisualOnly,       bool,   false,     "Ignore IMU data and output the stereo visual odometry of the front-end (PnP between consecutive frames). Used to validate the visual front-end.");
+    RTABMAP_PARAM(OdomVIO, MaxFeatures,      int,    200,       "Maximum number of tracked features. New GFTT corners are detected when tracks are lost.");
+    RTABMAP_PARAM(OdomVIO, MinFeatureDistance, double, 20.0,    "Minimum distance (pixels) between tracked features.");
+    RTABMAP_PARAM(OdomVIO, FeatureQuality,   double, 0.01,      "GFTT quality level of new corners (relative to the best corner of the image).");
+    RTABMAP_PARAM(OdomVIO, FlowWinSize,      int,    21,        "KLT window size (pixels).");
+    RTABMAP_PARAM(OdomVIO, FlowMaxLevel,     int,    3,         "KLT maximum pyramid level.");
+    RTABMAP_PARAM(OdomVIO, FlowBackCheck,    double, 1.0,       "Maximum distance (pixels) between a feature and its backward KLT track. 0 disables the backward check.");
+    RTABMAP_PARAM(OdomVIO, FundamentalThreshold, double, 1.0,   "Fundamental matrix RANSAC threshold (pixels) for outlier rejection of all tracks. 0 disables it.");
+    RTABMAP_PARAM(OdomVIO, PnPReprojError,   double, 2.0,       "PnP RANSAC reprojection error (pixels).");
+    RTABMAP_PARAM(OdomVIO, PnPIterations,    int,    100,       "PnP RANSAC iterations.");
+    RTABMAP_PARAM(OdomVIO, MinInliers,       int,    15,        "Minimum PnP inliers to accept a visual motion estimate.");
 
     // Odometry Open3D
     RTABMAP_PARAM(OdomOpen3D, MaxDepth,         float, 3.0,  "Maximum depth.");

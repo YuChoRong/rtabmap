@@ -26,6 +26,7 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 */
 
 #include "rtabmap/core/odometry/OdometryVIO.h"
+#include "rtabmap/core/odometry/VIOFrontend.h"
 #include "rtabmap/core/OdometryInfo.h"
 #include "rtabmap/utilite/ULogger.h"
 
@@ -53,6 +54,7 @@ struct OdometryVIO::Impl
 	Transform imuLocalTransform;     // base -> imu
 	Transform imuLocalTransformInv;  // imu -> base
 	Transform previousPoseInv;       // inverse of last base pose returned
+	std::unique_ptr<VIOFrontend> frontend;
 
 	void clear()
 	{
@@ -68,6 +70,10 @@ struct OdometryVIO::Impl
 		imuLocalTransform.setNull();
 		imuLocalTransformInv.setNull();
 		previousPoseInv.setNull();
+		if(frontend)
+		{
+			frontend->reset();
+		}
 	}
 };
 
@@ -75,8 +81,11 @@ OdometryVIO::OdometryVIO(const ParametersMap & parameters) :
 	Odometry(parameters),
 	impl_(new Impl),
 	initGravity_(false),
-	initImuSamples_(Parameters::defaultOdomVIOInitImuSamples())
+	initImuSamples_(Parameters::defaultOdomVIOInitImuSamples()),
+	visualOnly_(Parameters::defaultOdomVIOVisualOnly())
 {
+	impl_->frontend.reset(new VIOFrontend(parameters));
+	Parameters::parse(parameters, Parameters::kOdomVIOVisualOnly(), visualOnly_);
 #ifdef RTABMAP_GTSAM
 	double accNoise = Parameters::defaultOdomVIOAccNoise();
 	double gyroNoise = Parameters::defaultOdomVIOGyroNoise();
@@ -118,6 +127,42 @@ void OdometryVIO::reset(const Transform & initialPose)
 	initGravity_ = false;
 }
 
+namespace {
+
+bool hasStereo(const SensorData & data)
+{
+	return data.stereoCameraModels().size() == 1 &&
+			!data.imageRaw().empty() && !data.rightRaw().empty();
+}
+
+void fillFrontendInfo(const VIOFrontend & frontend, OdometryInfo * info)
+{
+	if(!info)
+	{
+		return;
+	}
+	const VIOFrontend::Stats & stats = frontend.stats();
+	info->features = (int)frontend.tracks().size();
+	info->reg.matches = stats.tracked;
+	info->reg.inliers = stats.inliers;
+	info->refCorners = frontend.previousCorners();
+	info->newCorners = frontend.currentCorners();
+	info->cornerInliers = frontend.cornerInliers();
+	info->words.clear();
+	info->reg.inliersIDs.clear();
+	for(size_t i=0; i<frontend.tracks().size(); ++i)
+	{
+		const VIOFrontend::Track & track = frontend.tracks()[i];
+		info->words.insert(std::make_pair(track.id, cv::KeyPoint(track.left, 1.0f)));
+		if(track.age > 1)
+		{
+			info->reg.inliersIDs.push_back(track.id);
+		}
+	}
+}
+
+} // namespace
+
 // return not null transform if odometry is correctly computed
 Transform OdometryVIO::computeTransform(
 		SensorData & data,
@@ -125,8 +170,41 @@ Transform OdometryVIO::computeTransform(
 		OdometryInfo * info)
 {
 	Transform t;
-#ifdef RTABMAP_GTSAM
 	Impl & d = *impl_;
+
+	if(visualOnly_)
+	{
+		// Stereo visual odometry of the front-end only, IMU is ignored
+		if(hasStereo(data))
+		{
+			bool firstFrame = !d.frontend->hasPrevious();
+			cv::Mat covariance;
+			if(d.frontend->process(data.imageRaw(), data.rightRaw(), data.stereoCameraModels()[0], guess, &t, &covariance))
+			{
+				if(firstFrame)
+				{
+					t = Transform::getIdentity();
+					covariance = cv::Mat::eye(6, 6, CV_64FC1) * 1e-9;
+				}
+				if(info)
+				{
+					info->type = this->getType();
+					fillFrontendInfo(*d.frontend, info);
+					if(!t.isNull())
+					{
+						info->reg.covariance = covariance;
+					}
+				}
+			}
+		}
+		else if(!data.imageRaw().empty())
+		{
+			UERROR("%s=true requires rectified stereo images", Parameters::kOdomVIOVisualOnly().c_str());
+		}
+		return t;
+	}
+
+#ifdef RTABMAP_GTSAM
 
 	if(!data.imu().empty())
 	{
@@ -214,6 +292,14 @@ Transform OdometryVIO::computeTransform(
 
 		d.state = predicted;
 		d.preintegrated->resetIntegrationAndSetBias(d.bias);
+
+		// Visual tracking only feeds the info for now: the back-end (next stage)
+		// will use the tracks. The IMU motion initializes KLT.
+		if(hasStereo(data))
+		{
+			d.frontend->process(data.imageRaw(), data.rightRaw(), data.stereoCameraModels()[0], t);
+			fillFrontendInfo(*d.frontend, info);
+		}
 
 		if(info)
 		{
