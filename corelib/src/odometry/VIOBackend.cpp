@@ -34,6 +34,8 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include <gtsam/geometry/StereoPoint2.h>
 #include <gtsam_unstable/nonlinear/IncrementalFixedLagSmoother.h>
 #include <gtsam_unstable/slam/SmartStereoProjectionPoseFactor.h>
+#include <cmath>
+#include <limits>
 
 namespace rtabmap {
 
@@ -45,12 +47,14 @@ VIOBackend::VIOBackend(const ParametersMap & parameters) :
 	windowSize_(Parameters::defaultOdomVIOWindowSize()),
 	pixelNoise_(Parameters::defaultOdomVIOPixelNoise()),
 	extraIterations_(Parameters::defaultOdomVIOBackendIterations()),
+	monoObservations_(Parameters::defaultOdomVIOMonoObservations()),
 	index_(0),
 	lastStamp_(0.0)
 {
 	Parameters::parse(parameters, Parameters::kOdomVIOWindowSize(), windowSize_);
 	Parameters::parse(parameters, Parameters::kOdomVIOPixelNoise(), pixelNoise_);
 	Parameters::parse(parameters, Parameters::kOdomVIOBackendIterations(), extraIterations_);
+	Parameters::parse(parameters, Parameters::kOdomVIOMonoObservations(), monoObservations_);
 	UASSERT(windowSize_ > 0.0);
 	UASSERT(pixelNoise_ > 0.0);
 	UASSERT(extraIterations_ >= 0);
@@ -183,7 +187,7 @@ void VIOBackend::addObservations(
 	for(size_t i=0; i<tracks.size(); ++i)
 	{
 		const VIOFrontend::Track & track = tracks[i];
-		if(!track.hasDepth())
+		if(!track.hasDepth() && !monoObservations_)
 		{
 			continue;
 		}
@@ -211,8 +215,25 @@ void VIOBackend::addObservations(
 			}
 			entry.observations.swap(kept);
 		}
+		bool hasStereo = false;
+		for(size_t j=0; j<entry.observations.size() && !hasStereo; ++j)
+		{
+			hasStereo = !std::isnan(entry.observations[j].second.uR());
+		}
+		if(!track.hasDepth() && !hasStereo)
+		{
+			// Left only: triangulated from at least one stereo observation
+			if(iter != trackFactors_.end())
+			{
+				current.insert(std::make_pair(track.id, entry));
+			}
+			continue;
+		}
+		// The right coordinate is NaN for a left only observation
 		entry.observations.push_back(std::make_pair(index_,
-				gtsam::StereoPoint2(track.left.x, track.right.x, track.left.y)));
+				gtsam::StereoPoint2(track.left.x,
+						track.hasDepth()?track.right.x:std::numeric_limits<double>::quiet_NaN(),
+						track.left.y)));
 		++stats_.observations;
 
 		if(entry.observations.size() >= 2)

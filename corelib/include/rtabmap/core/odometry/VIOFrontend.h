@@ -125,6 +125,7 @@ private:
 	int flowWinSize_;
 	int flowMaxLevel_;
 	double flowBackCheck_;
+	double stereoBackCheck_;
 	double fundamentalThreshold_;
 	double pnpReprojError_;
 	int pnpIterations_;

@@ -721,6 +721,7 @@ class RTABMAP_CORE_EXPORT Parameters
     RTABMAP_PARAM(OdomVIO, GyroBiasNoise,    double, 1.9393e-5, "Gyroscope bias random walk (rad/s^2/sqrt(Hz)).");
     RTABMAP_PARAM(OdomVIO, Gravity,          double, 9.81,      "Gravity magnitude (m/s^2).");
     RTABMAP_PARAM(OdomVIO, InitImuSamples,   int,    100,       "Number of IMU samples of the static window used to initialize: the mean acceleration gives the gravity direction and the mean angular velocity the gyroscope bias. Initialization waits until the last samples form a static window.");
+    RTABMAP_PARAM(OdomVIO, InitFilterSamples, int,   10,        "Consecutive IMU samples averaged together before computing the standard deviations of a static window, so that high frequency vibrations (e.g., propellers of a hovering drone) are not taken as motion. 1 disables the averaging.");
     RTABMAP_PARAM(OdomVIO, InitMaxAccStd,    double, 0.1,       "Maximum standard deviation (m/s^2) of the accelerometer samples of a static window.");
     RTABMAP_PARAM(OdomVIO, InitMaxGyroStd,   double, 0.02,      "Maximum standard deviation (rad/s) of the gyroscope samples of a static window.");
     RTABMAP_PARAM(OdomVIO, InitMaxGyroBias,  double, 0.1,       "Maximum norm (rad/s) of the mean angular velocity of a static window (the expected gyroscope bias range), so that a constant rotation is not taken as static.");
@@ -732,6 +733,7 @@ class RTABMAP_CORE_EXPORT Parameters
     RTABMAP_PARAM(OdomVIO, FlowWinSize,      int,    21,        "KLT window size (pixels).");
     RTABMAP_PARAM(OdomVIO, FlowMaxLevel,     int,    3,         "KLT maximum pyramid level.");
     RTABMAP_PARAM(OdomVIO, FlowBackCheck,    double, 1.0,       "Maximum distance (pixels) between a feature and its backward KLT track. 0 disables the backward check.");
+    RTABMAP_PARAM(OdomVIO, StereoBackCheck,  double, 1.0,       "Maximum distance (pixels) between a left feature and the KLT track of its right correspondence back to the left image. Rejects wrong stereo matches (e.g., on repetitive textures). 0 disables the check.");
     RTABMAP_PARAM(OdomVIO, FundamentalThreshold, double, 1.0,   "Fundamental matrix RANSAC threshold (pixels) for outlier rejection of all tracks. 0 disables it.");
     RTABMAP_PARAM(OdomVIO, PnPReprojError,   double, 2.0,       "PnP RANSAC reprojection error (pixels).");
     RTABMAP_PARAM(OdomVIO, PnPIterations,    int,    100,       "PnP RANSAC iterations.");
@@ -739,6 +741,7 @@ class RTABMAP_CORE_EXPORT Parameters
     RTABMAP_PARAM(OdomVIO, KeyframeInterval, double, 0.1,       "Minimum time (s) between two keyframes of the back-end. Frames in between output the IMU propagation from the last keyframe.");
     RTABMAP_PARAM(OdomVIO, WindowSize,       double, 1.5,       "Length (s) of the fixed-lag smoother window. Older keyframes are marginalized.");
     RTABMAP_PARAM(OdomVIO, PixelNoise,       double, 1.0,       "Standard deviation (pixels) of the stereo observations in the back-end.");
+    RTABMAP_PARAM(OdomVIO, MonoObservations, bool,   true,      "Also add the observations of tracks without stereo depth (left image only) to the back-end, for tracks having at least one stereo observation in the window. Helps when the stereo matching fails (e.g., objects too close).");
     RTABMAP_PARAM(OdomVIO, BackendIterations, int,   1,         "Extra smoother iterations after each keyframe update.");
 
     // Odometry Open3D

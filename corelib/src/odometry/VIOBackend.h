@@ -136,6 +136,7 @@ private:
 	double windowSize_;
 	double pixelNoise_;
 	int extraIterations_;
+	bool monoObservations_;
 
 	std::unique_ptr<gtsam::IncrementalFixedLagSmoother> smoother_;
 	gtsam::Pose3 imuToCamera_;

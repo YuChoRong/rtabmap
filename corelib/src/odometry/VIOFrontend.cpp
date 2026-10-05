@@ -48,6 +48,7 @@ VIOFrontend::VIOFrontend(const ParametersMap & parameters) :
 	flowWinSize_(Parameters::defaultOdomVIOFlowWinSize()),
 	flowMaxLevel_(Parameters::defaultOdomVIOFlowMaxLevel()),
 	flowBackCheck_(Parameters::defaultOdomVIOFlowBackCheck()),
+	stereoBackCheck_(Parameters::defaultOdomVIOStereoBackCheck()),
 	fundamentalThreshold_(Parameters::defaultOdomVIOFundamentalThreshold()),
 	pnpReprojError_(Parameters::defaultOdomVIOPnPReprojError()),
 	pnpIterations_(Parameters::defaultOdomVIOPnPIterations()),
@@ -61,6 +62,7 @@ VIOFrontend::VIOFrontend(const ParametersMap & parameters) :
 	Parameters::parse(parameters, Parameters::kOdomVIOFlowWinSize(), flowWinSize_);
 	Parameters::parse(parameters, Parameters::kOdomVIOFlowMaxLevel(), flowMaxLevel_);
 	Parameters::parse(parameters, Parameters::kOdomVIOFlowBackCheck(), flowBackCheck_);
+	Parameters::parse(parameters, Parameters::kOdomVIOStereoBackCheck(), stereoBackCheck_);
 	Parameters::parse(parameters, Parameters::kOdomVIOFundamentalThreshold(), fundamentalThreshold_);
 	Parameters::parse(parameters, Parameters::kOdomVIOPnPReprojError(), pnpReprojError_);
 	Parameters::parse(parameters, Parameters::kOdomVIOPnPIterations(), pnpIterations_);
@@ -254,7 +256,8 @@ bool VIOFrontend::process(
 		}
 		else
 		{
-			UWARN("Not enough tracks with depth for PnP (%d, min=%d)", (int)words3A.size(), minInliers_);
+			UWARN("Not enough tracks with depth for PnP (%d, min=%d, tracked=%d/%d)",
+					(int)words3A.size(), minInliers_, stats_.tracked, (int)tracks_.size());
 		}
 
 		// Keep the inliers
@@ -350,6 +353,24 @@ void VIOFrontend::computeDepth(const cv::Mat & left, const cv::Mat & right, cons
 	}
 	std::vector<unsigned char> status;
 	std::vector<cv::Point2f> rightPts = stereo_->computeCorrespondences(left, right, leftPts, status);
+	if(stereoBackCheck_ > 0.0 && rightPts.size() == leftPts.size())
+	{
+		// Left-right consistency: track the right correspondences back to the left image
+		std::vector<cv::Point2f> backPts = leftPts;
+		std::vector<unsigned char> backStatus;
+		std::vector<float> err;
+		cv::calcOpticalFlowPyrLK(right, left, rightPts, backPts, backStatus, err,
+				cv::Size(flowWinSize_, flowWinSize_), 1,
+				cv::TermCriteria(cv::TermCriteria::COUNT+cv::TermCriteria::EPS, 30, 0.01),
+				cv::OPTFLOW_USE_INITIAL_FLOW);
+		for(size_t i=0; i<status.size(); ++i)
+		{
+			if(status[i] && (!backStatus[i] || cv::norm(backPts[i] - leftPts[i]) > stereoBackCheck_))
+			{
+				status[i] = 0;
+			}
+		}
+	}
 	int withDepth = 0;
 	for(size_t i=0; i<tracks_.size() && i<rightPts.size(); ++i)
 	{
