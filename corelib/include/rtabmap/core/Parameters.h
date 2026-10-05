@@ -720,7 +720,11 @@ class RTABMAP_CORE_EXPORT Parameters
     RTABMAP_PARAM(OdomVIO, AccBiasNoise,     double, 3.0e-3,    "Accelerometer bias random walk (m/s^3/sqrt(Hz)).");
     RTABMAP_PARAM(OdomVIO, GyroBiasNoise,    double, 1.9393e-5, "Gyroscope bias random walk (rad/s^2/sqrt(Hz)).");
     RTABMAP_PARAM(OdomVIO, Gravity,          double, 9.81,      "Gravity magnitude (m/s^2).");
-    RTABMAP_PARAM(OdomVIO, InitImuSamples,   int,    20,        "Number of IMU samples averaged to estimate the gravity direction at start. The sensor should be static during that time.");
+    RTABMAP_PARAM(OdomVIO, InitImuSamples,   int,    100,       "Number of IMU samples of the static window used to initialize: the mean acceleration gives the gravity direction and the mean angular velocity the gyroscope bias. Initialization waits until the last samples form a static window.");
+    RTABMAP_PARAM(OdomVIO, InitMaxAccStd,    double, 0.1,       "Maximum standard deviation (m/s^2) of the accelerometer samples of a static window.");
+    RTABMAP_PARAM(OdomVIO, InitMaxGyroStd,   double, 0.02,      "Maximum standard deviation (rad/s) of the gyroscope samples of a static window.");
+    RTABMAP_PARAM(OdomVIO, InitMaxGyroBias,  double, 0.1,       "Maximum norm (rad/s) of the mean angular velocity of a static window (the expected gyroscope bias range), so that a constant rotation is not taken as static.");
+    RTABMAP_PARAM(OdomVIO, InitMaxMotion,    double, 0.005,     "With stereo images, maximum camera translation (m) over a static window, estimated by PnP between its first and last images (an IMU cannot tell constant velocity from no motion).");
     RTABMAP_PARAM(OdomVIO, VisualOnly,       bool,   false,     "Ignore IMU data and output the stereo visual odometry of the front-end (PnP between consecutive frames). Used to validate the visual front-end.");
     RTABMAP_PARAM(OdomVIO, MaxFeatures,      int,    200,       "Maximum number of tracked features. New GFTT corners are detected when tracks are lost.");
     RTABMAP_PARAM(OdomVIO, MinFeatureDistance, double, 20.0,    "Minimum distance (pixels) between tracked features.");

@@ -193,3 +193,74 @@ TEST(OdometryVIOTest, TiltedStartIsAlignedWithGravity)
 	EXPECT_NEAR(pose.x(), 0.0, 1e-3);
 	EXPECT_NEAR(pose.z(), 0.0, 1e-3);
 }
+
+TEST(OdometryVIOTest, EstimatesGyroBiasWhileStatic)
+{
+	if(!vioAvailable()) GTEST_SKIP() << "RTAB-Map built without GTSAM";
+	OdometryVIO odom(vioTestParameters());
+	// Gyro bias of 0.03 rad/s: without its estimation, the heading would drift by 0.06 rad
+	const cv::Vec3d bias(0.01, -0.02, 0.015);
+	const double t0 = 0.5, w = 0.5, duration = 2.5;
+	Transform pose = runSequence(odom, duration, [=](double t) {
+		return std::make_pair(cv::Vec3d(0, 0, t > t0 ? w : 0.0) + bias, cv::Vec3d(0,0,kGravity));
+	});
+	float roll, pitch, yaw;
+	pose.getEulerAngles(roll, pitch, yaw);
+	EXPECT_NEAR(roll, 0.0, 2e-3);
+	EXPECT_NEAR(pitch, 0.0, 2e-3);
+	// The bias is exactly estimated: what remains is the midpoint integration of
+	// the angular velocity step (half a sample at 0.5 rad/s = 1.25e-3 rad)
+	EXPECT_NEAR(pose.theta(), w * (duration - t0), 2e-3);
+}
+
+TEST(OdometryVIOTest, WaitsForStaticWindowAfterMovingStart)
+{
+	if(!vioAvailable()) GTEST_SKIP() << "RTAB-Map built without GTSAM";
+	OdometryVIO odom(vioTestParameters());
+	// Shaken for 1 s, static for 0.5 s, then 0.5 m/s^2 along x for 1 s
+	const double shake = 1.0, t0 = 1.5, a = 0.5, duration = 2.5;
+	int lost = 0;
+	Transform pose = runSequence(odom, duration, [=](double t) {
+		if(t < shake)
+		{
+			return std::make_pair(cv::Vec3d(0.3*std::sin(15*t), 0.2*std::cos(11*t), 0),
+					cv::Vec3d(2.0*std::sin(10*t), 1.0*std::cos(7*t), kGravity));
+		}
+		return std::make_pair(cv::Vec3d(0,0,0), cv::Vec3d(t > t0 ? a : 0.0, 0, kGravity));
+	}, Transform::getIdentity(), &lost);
+	// No pose before the end of the first static window (shake + 20 samples)
+	EXPECT_GE(lost, (int)(shake * kCameraRate));
+	EXPECT_LE(lost, (int)((shake + 0.15) * kCameraRate));
+	const double T = duration - t0;
+	EXPECT_NEAR(pose.x(), 0.5 * a * T * T, 0.01);
+	EXPECT_NEAR(pose.y(), 0.0, 1e-3);
+	EXPECT_NEAR(pose.z(), 0.0, 1e-3);
+}
+
+TEST(OdometryVIOTest, ConstantRotationIsNotStatic)
+{
+	if(!vioAvailable()) GTEST_SKIP() << "RTAB-Map built without GTSAM";
+	OdometryVIO odom(vioTestParameters());
+	// Spinning at a constant 0.5 rad/s: low variance, but too fast to be a gyro bias
+	int lost = 0;
+	runSequence(odom, 1.0, [](double) {
+		return std::make_pair(cv::Vec3d(0,0,0.5), cv::Vec3d(0,0,kGravity));
+	}, Transform::getIdentity(), &lost);
+	EXPECT_EQ(lost, (int)(1.0 * kCameraRate) + 1);
+}
+
+TEST(OdometryVIOTest, NoisyStaticStartInitializes)
+{
+	if(!vioAvailable()) GTEST_SKIP() << "RTAB-Map built without GTSAM";
+	OdometryVIO odom(vioTestParameters());
+	// White noise like a real IMU at rest (acc 0.03 m/s^2, gyro 0.003 rad/s per sample)
+	cv::RNG rng(7);
+	int lost = 0;
+	Transform pose = runSequence(odom, 0.5, [&](double) {
+		return std::make_pair(
+				cv::Vec3d(rng.gaussian(0.003), rng.gaussian(0.003), rng.gaussian(0.003)),
+				cv::Vec3d(rng.gaussian(0.03), rng.gaussian(0.03), kGravity + rng.gaussian(0.03)));
+	}, Transform::getIdentity(), &lost);
+	EXPECT_LE(lost, 3);
+	EXPECT_LT(pose.getNorm(), 0.01);
+}
