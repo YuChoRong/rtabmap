@@ -73,6 +73,7 @@ OdometryOpenVINS::OdometryOpenVINS(const ParametersMap & parameters) :
 	Parameters::parse(parameters, Parameters::kOdomOpenVINSFiMaxBaseline(), params_->featinit_options.max_baseline);
 	Parameters::parse(parameters, Parameters::kOdomOpenVINSFiMaxCondNumber(), params_->featinit_options.max_cond_number);
 	Parameters::parse(parameters, Parameters::kOdomOpenVINSUseFEJ(), params_->state_options.do_fej);
+	enum_index = Parameters::defaultOdomOpenVINSIntegration();
 	Parameters::parse(parameters, Parameters::kOdomOpenVINSIntegration(), enum_index);
 	params_->state_options.integration_method = ov_msckf::StateOptions::IntegrationMethod(enum_index);
 	Parameters::parse(parameters, Parameters::kOdomOpenVINSCalibCamExtrinsics(), params_->state_options.do_calib_camera_pose);
@@ -84,8 +85,10 @@ OdometryOpenVINS::OdometryOpenVINS(const ParametersMap & parameters) :
 	Parameters::parse(parameters, Parameters::kOdomOpenVINSMaxSLAM(), params_->state_options.max_slam_features);
 	Parameters::parse(parameters, Parameters::kOdomOpenVINSMaxSLAMInUpdate(), params_->state_options.max_slam_in_update);
 	Parameters::parse(parameters, Parameters::kOdomOpenVINSMaxMSCKFInUpdate(), params_->state_options.max_msckf_in_update);
+	enum_index = Parameters::defaultOdomOpenVINSFeatRepMSCKF();
 	Parameters::parse(parameters, Parameters::kOdomOpenVINSFeatRepMSCKF(), enum_index);
 	params_->state_options.feat_rep_msckf = ov_type::LandmarkRepresentation::Representation(enum_index);
+	enum_index = Parameters::defaultOdomOpenVINSFeatRepSLAM();
 	Parameters::parse(parameters, Parameters::kOdomOpenVINSFeatRepSLAM(), enum_index);
 	params_->state_options.feat_rep_slam = ov_type::LandmarkRepresentation::Representation(enum_index);
 	Parameters::parse(parameters, Parameters::kOdomOpenVINSDtSLAMDelay(), params_->dt_slam_delay);
