@@ -34,6 +34,8 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include <gtsam/geometry/StereoPoint2.h>
 #include <gtsam_unstable/nonlinear/IncrementalFixedLagSmoother.h>
 #include <gtsam_unstable/slam/SmartStereoProjectionPoseFactor.h>
+#include <gtsam/slam/StereoFactor.h>
+#include <opencv2/imgproc/imgproc.hpp>
 #include <cmath>
 #include <limits>
 
@@ -42,6 +44,7 @@ namespace rtabmap {
 using gtsam::symbol_shorthand::X; // IMU pose in world
 using gtsam::symbol_shorthand::V; // velocity in world
 using gtsam::symbol_shorthand::B; // IMU bias
+using gtsam::symbol_shorthand::L; // map point in world
 
 VIOBackend::VIOBackend(const ParametersMap & parameters) :
 	windowSize_(Parameters::defaultOdomVIOWindowSize()),
@@ -49,7 +52,8 @@ VIOBackend::VIOBackend(const ParametersMap & parameters) :
 	extraIterations_(Parameters::defaultOdomVIOBackendIterations()),
 	monoObservations_(Parameters::defaultOdomVIOMonoObservations()),
 	index_(0),
-	lastStamp_(0.0)
+	lastStamp_(0.0),
+	nextLandmark_(0)
 {
 	Parameters::parse(parameters, Parameters::kOdomVIOWindowSize(), windowSize_);
 	Parameters::parse(parameters, Parameters::kOdomVIOPixelNoise(), pixelNoise_);
@@ -72,6 +76,8 @@ void VIOBackend::reset()
 	lastStamp_ = 0.0;
 	keyframeStamps_.clear();
 	trackFactors_.clear();
+	landmarkKeys_.clear();
+	landmarkEstimates_.clear();
 	state_ = gtsam::NavState();
 	bias_ = gtsam::imuBias::ConstantBias();
 	stats_ = Stats();
@@ -127,7 +133,7 @@ bool VIOBackend::initialize(
 	std::vector<int> updatedTracks;
 	gtsam::FactorIndices factorsToRemove;
 	size_t firstSmartFactor = graph.size();
-	addObservations(tracks, graph, updatedTracks, factorsToRemove);
+	addObservations(tracks, std::map<int, Landmark>(), graph, updatedTracks, factorsToRemove);
 	return optimize(graph, values, timestamps, factorsToRemove, updatedTracks, firstSmartFactor);
 }
 
@@ -135,7 +141,8 @@ bool VIOBackend::addKeyframe(
 		double stamp,
 		const gtsam::PreintegratedCombinedMeasurements & preintegrated,
 		const gtsam::NavState & predicted,
-		const std::vector<VIOFrontend::Track> & tracks)
+		const std::vector<VIOFrontend::Track> & tracks,
+		const std::map<int, Landmark> & landmarks)
 {
 	UASSERT(initialized());
 	UASSERT(stamp > lastStamp_);
@@ -160,15 +167,68 @@ bool VIOBackend::addKeyframe(
 		keyframeStamps_.erase(keyframeStamps_.begin());
 	}
 
+	addLandmarkObservations(stamp, tracks, landmarks, graph, values, timestamps);
+
 	std::vector<int> updatedTracks;
 	gtsam::FactorIndices factorsToRemove;
 	size_t firstSmartFactor = graph.size();
-	addObservations(tracks, graph, updatedTracks, factorsToRemove);
+	addObservations(tracks, landmarks, graph, updatedTracks, factorsToRemove);
 	return optimize(graph, values, timestamps, factorsToRemove, updatedTracks, firstSmartFactor);
+}
+
+void VIOBackend::addLandmarkObservations(
+		double stamp,
+		const std::vector<VIOFrontend::Track> & tracks,
+		const std::map<int, Landmark> & landmarks,
+		gtsam::NonlinearFactorGraph & graph,
+		gtsam::Values & values,
+		std::map<gtsam::Key, double> & timestamps)
+{
+	stats_.landmarks = 0;
+	if(landmarks.empty())
+	{
+		return;
+	}
+	gtsam::SharedNoiseModel noise = gtsam::noiseModel::Robust::Create(
+			gtsam::noiseModel::mEstimator::Huber::Create(1.345),
+			gtsam::noiseModel::Isotropic::Sigma(3, pixelNoise_));
+	const gtsam::Values & linearizationPoint = smoother_->getLinearizationPoint();
+	for(size_t i=0; i<tracks.size(); ++i)
+	{
+		const VIOFrontend::Track & track = tracks[i];
+		std::map<int, Landmark>::const_iterator iter = landmarks.find(track.id);
+		if(iter == landmarks.end() || !track.hasDepth())
+		{
+			continue;
+		}
+		const Landmark & landmark = iter->second;
+		std::map<int, gtsam::Key>::iterator keyIter = landmarkKeys_.find(landmark.mapId);
+		gtsam::Key key;
+		if(keyIter != landmarkKeys_.end() &&
+		   (linearizationPoint.exists(keyIter->second) || values.exists(keyIter->second)))
+		{
+			key = keyIter->second;
+		}
+		else
+		{
+			// Not in the window (anymore): new variable anchored at its map position
+			key = L(nextLandmark_++);
+			landmarkKeys_[landmark.mapId] = key;
+			values.insert(key, landmark.world);
+			graph.emplace_shared<gtsam::PriorFactor<gtsam::Point3> >(key, landmark.world,
+					gtsam::noiseModel::Isotropic::Sigma(3, landmark.sigma));
+		}
+		graph.emplace_shared<gtsam::GenericStereoFactor<gtsam::Pose3, gtsam::Point3> >(
+				gtsam::StereoPoint2(track.left.x, track.right.x, track.left.y),
+				noise, X(index_), key, K_, imuToCamera_);
+		timestamps[key] = stamp;
+		++stats_.landmarks;
+	}
 }
 
 void VIOBackend::addObservations(
 		const std::vector<VIOFrontend::Track> & tracks,
+		const std::map<int, Landmark> & landmarks,
 		gtsam::NonlinearFactorGraph & graph,
 		std::vector<int> & updatedTracks,
 		gtsam::FactorIndices & factorsToRemove)
@@ -187,8 +247,9 @@ void VIOBackend::addObservations(
 	for(size_t i=0; i<tracks.size(); ++i)
 	{
 		const VIOFrontend::Track & track = tracks[i];
-		if(!track.hasDepth() && !monoObservations_)
+		if((!track.hasDepth() && !monoObservations_) || landmarks.find(track.id) != landmarks.end())
 		{
+			// Landmark observations are not smart factors
 			continue;
 		}
 		TrackFactor entry;
@@ -287,6 +348,19 @@ bool VIOBackend::optimize(
 		gtsam::Values estimate = smoother_->calculateEstimate();
 		state_ = gtsam::NavState(estimate.at<gtsam::Pose3>(X(index_)), estimate.at<gtsam::Vector3>(V(index_)));
 		bias_ = estimate.at<gtsam::imuBias::ConstantBias>(B(index_));
+		landmarkEstimates_.clear();
+		for(std::map<int, gtsam::Key>::iterator iter=landmarkKeys_.begin(); iter!=landmarkKeys_.end();)
+		{
+			if(estimate.exists(iter->second))
+			{
+				landmarkEstimates_[iter->first] = estimate.at<gtsam::Point3>(iter->second);
+				++iter;
+			}
+			else
+			{
+				landmarkKeys_.erase(iter++); // marginalized
+			}
+		}
 		stats_.keyframes = (int)keyframeStamps_.size();
 	}
 	catch(const std::exception & e)
@@ -295,11 +369,287 @@ bool VIOBackend::optimize(
 		reset();
 		return false;
 	}
-	UDEBUG("Keyframe %d: %d smart factors updated (%d observations), %d keyframes in window, bias acc=(%f,%f,%f) gyro=(%f,%f,%f)",
-			index_, stats_.smartFactors, stats_.observations, stats_.keyframes,
+	UDEBUG("Keyframe %d: %d smart factors updated (%d observations), %d map points, %d keyframes in window, bias acc=(%f,%f,%f) gyro=(%f,%f,%f)",
+			index_, stats_.smartFactors, stats_.observations, stats_.landmarks, stats_.keyframes,
 			bias_.accelerometer()[0], bias_.accelerometer()[1], bias_.accelerometer()[2],
 			bias_.gyroscope()[0], bias_.gyroscope()[1], bias_.gyroscope()[2]);
 	return true;
+}
+
+VIOLocalMap::VIOLocalMap(const ParametersMap & parameters) :
+	sigma_(Parameters::defaultOdomVIOLocalMapSigma()),
+	radius_(Parameters::defaultOdomVIOLocalMapRadius()),
+	maxDescDistance_(Parameters::defaultOdomVIOLocalMapMaxDescDistance()),
+	maxSize_(Parameters::defaultOdomVIOLocalMapSize()),
+	depthNoise_(0.0),
+	nextId_(0),
+	lastMatches_(0)
+{
+	Parameters::parse(parameters, Parameters::kOdomVIOLocalMapSigma(), sigma_);
+	Parameters::parse(parameters, Parameters::kOdomVIOLocalMapRadius(), radius_);
+	Parameters::parse(parameters, Parameters::kOdomVIOLocalMapMaxDescDistance(), maxDescDistance_);
+	Parameters::parse(parameters, Parameters::kOdomVIOLocalMapSize(), maxSize_);
+	UASSERT(sigma_ > 0.0);
+	UASSERT(radius_ > 0.0);
+	UASSERT(maxSize_ > 0);
+	double pixelNoise = Parameters::defaultOdomVIOPixelNoise();
+	Parameters::parse(parameters, Parameters::kOdomVIOPixelNoise(), pixelNoise);
+	depthNoise_ = pixelNoise;
+	orb_ = cv::ORB::create();
+}
+
+VIOLocalMap::~VIOLocalMap()
+{
+}
+
+void VIOLocalMap::reset()
+{
+	points_.clear();
+	nextId_ = 0;
+	trackToPoint_.clear();
+	refound_.clear();
+	newDescriptors_.clear();
+	lastMatches_ = 0;
+}
+
+std::map<int, VIOBackend::Landmark> VIOLocalMap::match(
+		const cv::Mat & image,
+		const std::vector<VIOFrontend::Track> & tracks,
+		const StereoCameraModel & model,
+		const gtsam::Pose3 & imuPose,
+		const gtsam::Pose3 & imuToCamera,
+		const gtsam::Pose3 & imuToBase)
+{
+	lastMatches_ = 0;
+	newDescriptors_.clear();
+
+	// Forget the tracks lost since the last keyframe
+	std::set<int> alive;
+	for(size_t i=0; i<tracks.size(); ++i)
+	{
+		alive.insert(tracks[i].id);
+	}
+	for(std::map<int, int>::iterator iter=trackToPoint_.begin(); iter!=trackToPoint_.end();)
+	{
+		if(alive.find(iter->first) == alive.end())
+		{
+			refound_.erase(iter->first);
+			trackToPoint_.erase(iter++);
+		}
+		else
+		{
+			++iter;
+		}
+	}
+
+	// Descriptors of the new tracks with depth
+	cv::Mat gray = image;
+	if(image.channels() == 3)
+	{
+		cv::cvtColor(image, gray, cv::COLOR_BGR2GRAY);
+	}
+	std::vector<cv::KeyPoint> keypoints;
+	for(size_t i=0; i<tracks.size(); ++i)
+	{
+		if(tracks[i].hasDepth() && trackToPoint_.find(tracks[i].id) == trackToPoint_.end())
+		{
+			keypoints.push_back(cv::KeyPoint(tracks[i].left, 31.0f, -1.0f, 0.0f, 0, (int)i));
+		}
+	}
+	cv::Mat descriptors;
+	if(!keypoints.empty())
+	{
+		orb_->compute(gray, keypoints, descriptors); // removes the keypoints close to the border
+	}
+	std::vector<int> candidatesTrack; // track index of each descriptor row
+	for(size_t k=0; k<keypoints.size(); ++k)
+	{
+		newDescriptors_[tracks[keypoints[k].class_id].id] = descriptors.row((int)k);
+		candidatesTrack.push_back(keypoints[k].class_id);
+	}
+
+	// Map points not tracked anymore, projected in the image
+	std::set<int> tracked;
+	for(std::map<int, int>::iterator iter=trackToPoint_.begin(); iter!=trackToPoint_.end(); ++iter)
+	{
+		tracked.insert(iter->second);
+	}
+	const gtsam::Pose3 cameraPose = imuPose * imuToCamera;
+	const gtsam::Pose3 basePose = imuPose * imuToBase;
+	const double fx = model.left().fx();
+	const double fy = model.left().fy();
+	const double cx = model.left().cx();
+	const double cy = model.left().cy();
+	const int width = model.left().imageWidth()>0?model.left().imageWidth():image.cols;
+	const int height = model.left().imageHeight()>0?model.left().imageHeight():image.rows;
+	std::vector<std::pair<int, cv::Point2f> > visible; // map id, projection
+	for(std::map<int, Point>::iterator iter=points_.begin(); iter!=points_.end(); ++iter)
+	{
+		if(tracked.find(iter->first) != tracked.end())
+		{
+			continue;
+		}
+		gtsam::Point3 pc = cameraPose.transformTo(iter->second.world);
+		if(pc.z() < 0.1)
+		{
+			continue;
+		}
+		cv::Point2f uv(fx*pc.x()/pc.z()+cx, fy*pc.y()/pc.z()+cy);
+		if(uv.x < -radius_ || uv.y < -radius_ || uv.x > width+radius_ || uv.y > height+radius_)
+		{
+			continue;
+		}
+		visible.push_back(std::make_pair(iter->first, uv));
+	}
+
+	// Best match of each new track: close projection, close 3D position, ratio test
+	std::vector<std::pair<int, std::pair<int, int> > > matches; // distance, track index, map id
+	const double radiusSqr = radius_*radius_;
+	for(size_t k=0; k<candidatesTrack.size() && !visible.empty(); ++k)
+	{
+		const VIOFrontend::Track & track = tracks[candidatesTrack[k]];
+		gtsam::Point3 world = basePose.transformFrom(gtsam::Point3(track.point.x, track.point.y, track.point.z));
+		double maxDistance3D = 0.1 + 0.05*cameraPose.transformTo(world).z();
+		int best = -1;
+		int bestDistance = 256;
+		int secondDistance = 256;
+		const cv::Mat & descriptor = newDescriptors_.at(track.id);
+		for(size_t j=0; j<visible.size(); ++j)
+		{
+			float du = visible[j].second.x - track.left.x;
+			float dv = visible[j].second.y - track.left.y;
+			if(du*du+dv*dv > radiusSqr)
+			{
+				continue;
+			}
+			const Point & point = points_.at(visible[j].first);
+			if(gtsam::distance3(point.world, world) > maxDistance3D)
+			{
+				continue;
+			}
+			int distance = (int)cv::norm(descriptor, point.descriptor, cv::NORM_HAMMING);
+			if(distance < bestDistance)
+			{
+				secondDistance = bestDistance;
+				bestDistance = distance;
+				best = visible[j].first;
+			}
+			else if(distance < secondDistance)
+			{
+				secondDistance = distance;
+			}
+		}
+		if(best >= 0 && bestDistance <= maxDescDistance_ && bestDistance < 0.8*secondDistance)
+		{
+			matches.push_back(std::make_pair(bestDistance, std::make_pair(candidatesTrack[k], best)));
+		}
+	}
+	// One track per map point, best descriptor distance first
+	std::sort(matches.begin(), matches.end());
+	for(size_t i=0; i<matches.size(); ++i)
+	{
+		int mapId = matches[i].second.second;
+		if(tracked.insert(mapId).second)
+		{
+			int trackId = tracks[matches[i].second.first].id;
+			trackToPoint_[trackId] = mapId;
+			refound_.insert(trackId);
+			newDescriptors_.erase(trackId);
+			++lastMatches_;
+		}
+	}
+
+	// Landmarks of all the tracks that re-found a point
+	std::map<int, VIOBackend::Landmark> landmarks;
+	const double depthNoise = depthNoise_ / (fx * model.baseline());
+	for(std::set<int>::iterator iter=refound_.begin(); iter!=refound_.end(); ++iter)
+	{
+		int mapId = trackToPoint_.at(*iter);
+		const Point & point = points_.at(mapId);
+		VIOBackend::Landmark landmark;
+		landmark.mapId = mapId;
+		landmark.world = point.world;
+		// stereo depth uncertainty, reduced by the averaged observations
+		landmark.sigma = sigma_ + depthNoise * point.depth * point.depth / std::sqrt((double)point.observations);
+		landmarks.insert(std::make_pair(*iter, landmark));
+	}
+	UDEBUG("Local map: %d points, %d visible, %d new matches, %d landmarks",
+			(int)points_.size(), (int)visible.size(), lastMatches_, (int)landmarks.size());
+	return landmarks;
+}
+
+void VIOLocalMap::update(
+		double stamp,
+		const std::vector<VIOFrontend::Track> & tracks,
+		const gtsam::Pose3 & imuPose,
+		const gtsam::Pose3 & imuToBase,
+		const std::map<int, gtsam::Point3> & landmarkEstimates)
+{
+	const gtsam::Pose3 basePose = imuPose * imuToBase;
+	for(size_t i=0; i<tracks.size(); ++i)
+	{
+		const VIOFrontend::Track & track = tracks[i];
+		std::map<int, int>::iterator iter = trackToPoint_.find(track.id);
+		if(iter != trackToPoint_.end())
+		{
+			Point & point = points_.at(iter->second);
+			point.lastSeen = stamp;
+			if(refound_.find(track.id) != refound_.end())
+			{
+				std::map<int, gtsam::Point3>::const_iterator jter = landmarkEstimates.find(iter->second);
+				if(jter != landmarkEstimates.end())
+				{
+					point.world = jter->second;
+				}
+			}
+			else if(track.hasDepth() && point.observations < 20)
+			{
+				// Average of the stereo points of the track that created it
+				gtsam::Point3 world = basePose.transformFrom(gtsam::Point3(track.point.x, track.point.y, track.point.z));
+				point.world = (point.world * point.observations + world) / (point.observations + 1);
+				++point.observations;
+			}
+		}
+		else if(track.hasDepth())
+		{
+			std::map<int, cv::Mat>::iterator jter = newDescriptors_.find(track.id);
+			if(jter != newDescriptors_.end())
+			{
+				Point point;
+				point.world = basePose.transformFrom(gtsam::Point3(track.point.x, track.point.y, track.point.z));
+				point.descriptor = jter->second.clone();
+				point.observations = 1;
+				point.depth = std::sqrt(track.point.x*track.point.x + track.point.y*track.point.y + track.point.z*track.point.z);
+				point.lastSeen = stamp;
+				points_.insert(std::make_pair(nextId_, point));
+				trackToPoint_[track.id] = nextId_++;
+			}
+		}
+	}
+	newDescriptors_.clear();
+
+	// Remove the points not seen for the longest time
+	if((int)points_.size() > maxSize_)
+	{
+		std::set<int> tracked;
+		for(std::map<int, int>::iterator iter=trackToPoint_.begin(); iter!=trackToPoint_.end(); ++iter)
+		{
+			tracked.insert(iter->second);
+		}
+		std::vector<std::pair<double, int> > ages;
+		for(std::map<int, Point>::iterator iter=points_.begin(); iter!=points_.end(); ++iter)
+		{
+			if(tracked.find(iter->first) == tracked.end())
+			{
+				ages.push_back(std::make_pair(iter->second.lastSeen, iter->first));
+			}
+		}
+		std::sort(ages.begin(), ages.end());
+		for(size_t i=0; i<ages.size() && (int)points_.size() > maxSize_; ++i)
+		{
+			points_.erase(ages[i].second);
+		}
+	}
 }
 
 }

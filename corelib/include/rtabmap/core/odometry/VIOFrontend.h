@@ -120,6 +120,8 @@ private:
 private:
 	// parameters
 	int maxFeatures_;
+	int histogramEqualization_;
+	int gridCells_;
 	double minFeatureDistance_;
 	double featureQuality_;
 	int flowWinSize_;

@@ -727,8 +727,10 @@ class RTABMAP_CORE_EXPORT Parameters
     RTABMAP_PARAM(OdomVIO, InitMaxGyroBias,  double, 0.1,       "Maximum norm (rad/s) of the mean angular velocity of a static window (the expected gyroscope bias range), so that a constant rotation is not taken as static.");
     RTABMAP_PARAM(OdomVIO, InitMaxMotion,    double, 0.005,     "With stereo images, maximum camera translation (m) over a static window, estimated by PnP between its first and last images (an IMU cannot tell constant velocity from no motion).");
     RTABMAP_PARAM(OdomVIO, VisualOnly,       bool,   false,     "Ignore IMU data and output the stereo visual odometry of the front-end (PnP between consecutive frames). Used to validate the visual front-end.");
-    RTABMAP_PARAM(OdomVIO, MaxFeatures,      int,    300,       "Maximum number of tracked features. New GFTT corners are detected when tracks are lost.");
+    RTABMAP_PARAM(OdomVIO, MaxFeatures,      int,    350,       "Maximum number of tracked features. New GFTT corners are detected when tracks are lost.");
     RTABMAP_PARAM(OdomVIO, MinFeatureDistance, double, 15.0,    "Minimum distance (pixels) between tracked features.");
+    RTABMAP_PARAM(OdomVIO, HistogramEqualization, int, 0,       "Image preprocessing before tracking and stereo matching: 0=none, 1=histogram equalization, 2=CLAHE.");
+    RTABMAP_PARAM(OdomVIO, GridCells,        int,    1,         "New features are detected in a grid of GridCells x GridCells cells, each cell receiving the same share of OdomVIO/MaxFeatures, so that features cover the whole image. 1 detects in the whole image.");
     RTABMAP_PARAM(OdomVIO, FeatureQuality,   double, 0.01,      "GFTT quality level of new corners (relative to the best corner of the image).");
     RTABMAP_PARAM(OdomVIO, FlowWinSize,      int,    21,        "KLT window size (pixels).");
     RTABMAP_PARAM(OdomVIO, FlowMaxLevel,     int,    3,         "KLT maximum pyramid level.");
@@ -742,6 +744,11 @@ class RTABMAP_CORE_EXPORT Parameters
     RTABMAP_PARAM(OdomVIO, WindowSize,       double, 2.0,       "Length (s) of the fixed-lag smoother window. Older keyframes are marginalized.");
     RTABMAP_PARAM(OdomVIO, PixelNoise,       double, 1.0,       "Standard deviation (pixels) of the stereo observations in the back-end.");
     RTABMAP_PARAM(OdomVIO, MonoObservations, bool,   false,      "Also add the observations of tracks without stereo depth (left image only) to the back-end, for tracks having at least one stereo observation in the window. Helps when the stereo matching fails (e.g., objects too close).");
+    RTABMAP_PARAM(OdomVIO, LocalMap,         bool,   true,      "Keep a local map of the 3D points of the stereo tracks (with ORB descriptors), and match the new tracks of each keyframe to the map points that are not tracked anymore (projected with the IMU prediction). A matched track observes its map point as a variable in the back-end, anchored to its map position, so that coming back to an area seen before reduces the drift.");
+    RTABMAP_PARAM(OdomVIO, LocalMapSize,     int,    5000,      "Maximum number of points in the local map. The points not seen for the longest time are removed first.");
+    RTABMAP_PARAM(OdomVIO, LocalMapSigma,    double, 0.05,      "Standard deviation (m) of the position prior of a map point re-observed after it left the window, added to its stereo depth uncertainty.");
+    RTABMAP_PARAM(OdomVIO, LocalMapRadius,   double, 15.0,      "Search radius (pixels) around the projection of a map point for its matching track.");
+    RTABMAP_PARAM(OdomVIO, LocalMapMaxDescDistance, int, 50,    "Maximum ORB descriptor distance (Hamming) of a match between a track and a map point.");
     RTABMAP_PARAM(OdomVIO, BackendIterations, int,   3,         "Extra smoother iterations after each keyframe update.");
 
     // Odometry Open3D

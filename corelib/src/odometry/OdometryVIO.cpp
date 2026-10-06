@@ -77,6 +77,7 @@ struct OdometryVIO::Impl
 	std::unique_ptr<VIOFrontend> frontend;
 #ifdef RTABMAP_GTSAM_UNSTABLE
 	std::unique_ptr<VIOBackend> backend;
+	std::unique_ptr<VIOLocalMap> localMap; // null if disabled
 	bool backendStarted = false; // the back-end has been initialized at least once since clear()
 #endif
 	double keyframeInterval = 0.0;
@@ -137,6 +138,10 @@ struct OdometryVIO::Impl
 		{
 			backend->reset();
 		}
+		if(localMap)
+		{
+			localMap->reset();
+		}
 		backendStarted = false;
 #endif
 	}
@@ -152,6 +157,12 @@ OdometryVIO::OdometryVIO(const ParametersMap & parameters) :
 	impl_->frontend.reset(new VIOFrontend(parameters));
 #ifdef RTABMAP_GTSAM_UNSTABLE
 	impl_->backend.reset(new VIOBackend(parameters));
+	bool localMap = Parameters::defaultOdomVIOLocalMap();
+	Parameters::parse(parameters, Parameters::kOdomVIOLocalMap(), localMap);
+	if(localMap)
+	{
+		impl_->localMap.reset(new VIOLocalMap(parameters));
+	}
 #endif
 	impl_->keyframeInterval = Parameters::defaultOdomVIOKeyframeInterval();
 	Parameters::parse(parameters, Parameters::kOdomVIOKeyframeInterval(), impl_->keyframeInterval);
@@ -522,9 +533,21 @@ Transform OdometryVIO::computeTransform(
 			if(keyframe)
 			{
 				bool success;
+				const gtsam::Pose3 imuToCamera((d.imuLocalTransformInv * model.left().localTransform()).toEigen4d());
+				const gtsam::Pose3 imuToBase(d.imuLocalTransformInv.toEigen4d());
+				std::map<int, VIOBackend::Landmark> landmarks;
+				if(d.localMap)
+				{
+					landmarks = d.localMap->match(data.imageRaw(), d.frontend->tracks(), model, predicted.pose(), imuToCamera, imuToBase);
+				}
 				if(!d.backend->initialized())
 				{
-					gtsam::Pose3 imuToCamera((d.imuLocalTransformInv * model.left().localTransform()).toEigen4d());
+					if(d.localMap && d.backendStarted)
+					{
+						// Restarting after a failure: the map is in the old frame
+						d.localMap->reset();
+						landmarks = d.localMap->match(data.imageRaw(), d.frontend->tracks(), model, predicted.pose(), imuToCamera, imuToBase);
+					}
 					// Static start: zero velocity. After a failure, the velocity is the IMU prediction.
 					double velocitySigma = d.backendStarted ? 1.0 : 0.01;
 					success = d.backend->initialize(data.stamp(), predicted, d.bias, imuToCamera, model,
@@ -533,12 +556,16 @@ Transform OdometryVIO::computeTransform(
 				}
 				else
 				{
-					success = d.backend->addKeyframe(data.stamp(), *d.preintegrated, predicted, d.frontend->tracks());
+					success = d.backend->addKeyframe(data.stamp(), *d.preintegrated, predicted, d.frontend->tracks(), landmarks);
 				}
 				if(success)
 				{
 					output = d.backend->state();
 					d.bias = d.backend->bias();
+					if(d.localMap)
+					{
+						d.localMap->update(data.stamp(), d.frontend->tracks(), output.pose(), imuToBase, d.backend->landmarkEstimates());
+					}
 				}
 				// else: keep the IMU prediction, the back-end restarts at the next keyframe
 			}
