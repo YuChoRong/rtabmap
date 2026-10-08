@@ -1,0 +1,21 @@
+cmake_minimum_required(VERSION 3.10)
+project(colmap_viewer CXX)
+
+# Standalone viewer of a COLMAP text model against ground truth (Qt5 Widgets + Eigen)
+set(CMAKE_CXX_STANDARD 14)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_AUTOMOC ON)
+if(NOT CMAKE_BUILD_TYPE)
+  set(CMAKE_BUILD_TYPE Release)
+endif()
+
+find_package(Qt5 REQUIRED COMPONENTS Widgets)
+find_package(Eigen3 REQUIRED)
+
+add_executable(colmap_viewer main.cpp ColmapModel.cpp Views.cpp)
+target_include_directories(colmap_viewer PRIVATE ${EIGEN3_INCLUDE_DIR})
+target_link_libraries(colmap_viewer Qt5::Widgets)
+if(TARGET Eigen3::Eigen)
+  target_link_libraries(colmap_viewer Eigen3::Eigen)
+endif()
+install(TARGETS colmap_viewer DESTINATION bin)
