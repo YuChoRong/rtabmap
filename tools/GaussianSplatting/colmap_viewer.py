@@ -558,11 +558,17 @@ class MainWindow(QtWidgets.QMainWindow):
         self.plot.update()
         self.image.set_frame(self.slider.value())
         m, K, s = self.model, self.model.intrinsics, self.model.stats
-        text = '<b>%s</b><br>%d images, %d points, camera %s %dx%d f=%.1f c=(%.1f, %.1f), path %.2f m' % (
-            m.dir, len(m.frames), len(m.points), K['model'], K['width'], K['height'], K['fx'], K['cx'], K['cy'], m.path_length)
+        if K is None:  # no model loaded yet
+            return
+        # With a similarity alignment the model can have any scale (SfM): path also in reference units
+        path = '%.2f m' % m.path_length
+        if s and self.scale.isChecked():
+            path = '%.2f model units (%.2f m of reference)' % (m.path_length, m.path_length * s['scale'])
+        text = '<b>%s</b><br>%d images, %d points, camera %s %dx%d f=%.1f c=(%.1f, %.1f), path %s' % (
+            m.dir, len(m.frames), len(m.points), K['model'], K['width'], K['height'], K['fx'], K['cx'], K['cy'], path)
         if s:
             text += ('<br>Reference (%s): %s (%d matched)<br><b>Position error RMSE %.2f cm</b>, mean %.2f, median %.2f, '
-                     'max %.2f cm (reference units); scale estimate/reference %.4f (%s alignment)<br>Rotation error RMSE %.3f deg; '
+                     'max %.2f cm (reference units); scale reference/estimate %.4f (%s alignment)<br>Rotation error RMSE %.3f deg; '
                      'constant camera frame offset %.2f deg, RMSE without it %.3f deg') % (
                 m.ref_name, m.gt_path, s['matched'], s['rmse']*100, s['mean']*100, s['median']*100, s['max']*100, s['scale'],
                 'similarity' if self.scale.isChecked() else 'rigid', s['rot_rmse'], s['rot_offset'], s['rot_rmse_no_offset'])

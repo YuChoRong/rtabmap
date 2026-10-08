@@ -273,7 +273,7 @@ void ColmapModel::align(bool withScale)
 	Eigen::Matrix4d T = Eigen::umeyama(src, dst, true);
 	double scale = std::cbrt(T.block<3,3>(0,0).determinant());
 	Eigen::Matrix3d R = T.block<3,3>(0,0) / scale;
-	s.scale = 1.0 / scale; // the estimate is this much bigger than the ground truth
+	s.scale = 1.0 / scale; // ground truth size / estimate size
 	if(!withScale)
 	{
 		T = Eigen::umeyama(src, dst, false);

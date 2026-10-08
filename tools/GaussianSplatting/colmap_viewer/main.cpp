@@ -192,7 +192,7 @@ private:
 		if(model_.hasGroundTruth())
 		{
 			text += QString("<br>Ground truth: %1 (%2 matched)<br>"
-					"<b>Position error RMSE %3 cm</b>, mean %4, median %5, max %6 cm; scale estimate/GT %8 (%9 alignment)<br>"
+					"<b>Position error RMSE %3 cm</b>, mean %4, median %5, max %6 cm; scale GT/estimate %8 (%9 alignment)<br>"
 					"Rotation error RMSE %7 deg; constant camera frame offset %10 deg, RMSE without it %11 deg")
 					.arg(model_.groundTruthPath()).arg(s.matched)
 					.arg(s.rmse*100, 0, 'f', 2).arg(s.mean*100, 0, 'f', 2).arg(s.median*100, 0, 'f', 2).arg(s.max*100, 0, 'f', 2)
