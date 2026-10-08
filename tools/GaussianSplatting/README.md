@@ -23,13 +23,20 @@ More images give a better 3DGS model: with `rtabmap-euroc_dataset`, a higher
 
 ## 2. Check the model and compare with the ground truth
 
+Python version, no compilation (PySide6 LGPL-3.0 + numpy):
+
 ```bash
-cd colmap_viewer && mkdir build && cd build && cmake .. && make
-./colmap_viewer colmap_out            # gt_camera_poses.txt is loaded when present
-./colmap_viewer colmap_out --gt other_gt.txt
+pip install pyside6 numpy
+python3 colmap_viewer.py colmap_out            # gt_camera_poses.txt is loaded when present
+python3 colmap_viewer.py colmap_out --gt other_gt.txt
 ```
 
-Dependencies: Qt5 Widgets, Eigen3.
+The C++ version in `colmap_viewer/` has the same features (Qt5 or Qt6 Widgets
+and Eigen3, built with CMake):
+
+```bash
+cmake -S colmap_viewer -B build && cmake --build build && ./build/colmap_viewer colmap_out
+```
 
 - Left: top or side view of the points with the estimated trajectory (blue)
   and the ground truth aligned on it (orange, rigid or similarity alignment),
@@ -71,8 +78,9 @@ can be redistributed.
 
 ## Windows
 
-Tested parts: the Python scripts are platform independent, the viewer builds
-with Qt5 and Qt6, and the PowerShell script was checked with PowerShell 7.
+Tested parts: the Python scripts are platform independent, the C++ viewer
+builds with Qt5 and Qt6, and the PowerShell script was checked with PowerShell 7.
+Nothing needs CMake or a compiler except the optional C++ viewer.
 
 1. **Export** (only if you have your own RTAB-Map database; skip with a
    provided `colmap_*.zip`, extract it with `Expand-Archive colmap_v101.zip .`):
@@ -92,7 +100,10 @@ with Qt5 and Qt6, and the PowerShell script was checked with PowerShell 7.
    Toolkit of the same version, and run from the "x64 Native Tools Command
    Prompt". If PowerShell blocks the script, use `train_3dgs.bat` or
    `powershell -ExecutionPolicy Bypass -File train_3dgs.ps1 ...`.
-3. **Viewer** (Visual Studio 2019/2022 with C++, CMake):
+3. **Viewer**, no compilation: `colmap_viewer.bat colmap_v101` (creates or
+   reuses `.gs_env` and installs PySide6 and numpy at the first run).
+
+   Or the C++ viewer (Visual Studio 2019/2022 with C++, CMake):
    - with [vcpkg](https://github.com/microsoft/vcpkg): `vcpkg install qtbase eigen3 --triplet x64-windows`,
      `set VCPKG_ROOT=C:\vcpkg`, then `build_viewer_windows.bat`;
    - or with the Qt online installer (LGPL, MSVC 64-bit kit) and the Eigen
