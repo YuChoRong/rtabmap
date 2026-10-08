@@ -29,6 +29,7 @@ ParametersMap vioTestParameters()
 	parameters.insert(ParametersPair(Parameters::kRtabmapImagesAlreadyRectified(), "true"));
 	parameters.insert(ParametersPair(Parameters::kOdomVIOGravity(), uNumber2Str(kGravity)));
 	parameters.insert(ParametersPair(Parameters::kOdomVIOInitImuSamples(), "20"));
+	parameters.insert(ParametersPair(Parameters::kOdomVIOInitFilterSamples(), "1"));
 	return parameters;
 }
 
@@ -263,4 +264,31 @@ TEST(OdometryVIOTest, NoisyStaticStartInitializes)
 	}, Transform::getIdentity(), &lost);
 	EXPECT_LE(lost, 3);
 	EXPECT_LT(pose.getNorm(), 0.01);
+}
+
+TEST(OdometryVIOTest, VibratingStaticStartInitializes)
+{
+	if(!vioAvailable()) GTEST_SKIP() << "RTAB-Map built without GTSAM";
+	// Hovering drone: strong vibrations at half the IMU rate (100 Hz), no motion
+	auto vibrations = [](double t) {
+		double s = (std::lround(t * kImuRate) % 2) ? 1.0 : -1.0;
+		return std::make_pair(cv::Vec3d(0.05*s, -0.05*s, 0), cv::Vec3d(0.8*s, 0.6*s, kGravity - 0.5*s));
+	};
+	ParametersMap parameters = vioTestParameters();
+	{
+		// Raw samples: the vibrations look like motion
+		OdometryVIO odom(parameters);
+		int lost = 0;
+		runSequence(odom, 0.5, vibrations, Transform::getIdentity(), &lost);
+		EXPECT_EQ(lost, (int)(0.5 * kCameraRate) + 1);
+	}
+	{
+		// Averaged by pairs, the vibrations cancel out
+		parameters[Parameters::kOdomVIOInitFilterSamples()] = "2";
+		OdometryVIO odom(parameters);
+		int lost = 0;
+		Transform pose = runSequence(odom, 0.5, vibrations, Transform::getIdentity(), &lost);
+		EXPECT_LE(lost, 3);
+		EXPECT_LT(pose.getNorm(), 0.01);
+	}
 }

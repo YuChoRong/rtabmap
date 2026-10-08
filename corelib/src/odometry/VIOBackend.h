@@ -40,8 +40,10 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include <gtsam/geometry/StereoPoint2.h>
 #include <gtsam/nonlinear/NonlinearFactorGraph.h>
 #include <gtsam/nonlinear/Values.h>
+#include <opencv2/features2d/features2d.hpp>
 #include <map>
 #include <memory>
+#include <set>
 #include <vector>
 
 namespace gtsam {
@@ -69,6 +71,15 @@ public:
 		int keyframes = 0;      ///< Keyframes in the window.
 		int smartFactors = 0;   ///< Smart factors added or updated at the last keyframe.
 		int observations = 0;   ///< Stereo observations added at the last keyframe.
+		int landmarks = 0;      ///< Map point observations added at the last keyframe.
+	};
+
+	/** A map point observed by a track. */
+	struct Landmark
+	{
+		int mapId;
+		gtsam::Point3 world; ///< Position in world, prior when the point is not in the window.
+		double sigma;        ///< Standard deviation (m) of the prior.
 	};
 
 public:
@@ -103,13 +114,16 @@ public:
 			double stamp,
 			const gtsam::PreintegratedCombinedMeasurements & preintegrated,
 			const gtsam::NavState & predicted,
-			const std::vector<VIOFrontend::Track> & tracks);
+			const std::vector<VIOFrontend::Track> & tracks,
+			const std::map<int, Landmark> & landmarks = std::map<int, Landmark>());
 
 	double lastKeyframeStamp() const {return lastStamp_;}
 	/** Optimized state and bias of the last keyframe. */
 	const gtsam::NavState & state() const {return state_;}
 	const gtsam::imuBias::ConstantBias & bias() const {return bias_;}
 	const Stats & stats() const {return stats_;}
+	/** Optimized positions of the map points in the window (map id -> position in world). */
+	const std::map<int, gtsam::Point3> & landmarkEstimates() const {return landmarkEstimates_;}
 
 private:
 	struct TrackFactor
@@ -118,8 +132,16 @@ private:
 		long slot = -1; // index of its factor in the smoother, -1 if none
 	};
 
+	void addLandmarkObservations(
+			double stamp,
+			const std::vector<VIOFrontend::Track> & tracks,
+			const std::map<int, Landmark> & landmarks,
+			gtsam::NonlinearFactorGraph & graph,
+			gtsam::Values & values,
+			std::map<gtsam::Key, double> & timestamps);
 	void addObservations(
 			const std::vector<VIOFrontend::Track> & tracks,
+			const std::map<int, Landmark> & landmarks,
 			gtsam::NonlinearFactorGraph & graph,
 			std::vector<int> & updatedTracks,
 			gtsam::FactorIndices & factorsToRemove);
@@ -136,6 +158,7 @@ private:
 	double windowSize_;
 	double pixelNoise_;
 	int extraIterations_;
+	bool monoObservations_;
 
 	std::unique_ptr<gtsam::IncrementalFixedLagSmoother> smoother_;
 	gtsam::Pose3 imuToCamera_;
@@ -144,9 +167,80 @@ private:
 	double lastStamp_;
 	std::map<int, double> keyframeStamps_; // keyframe index -> stamp, in the window
 	std::map<int, TrackFactor> trackFactors_; // track id -> factor
+	std::map<int, gtsam::Key> landmarkKeys_; // map id -> variable, in the window
+	std::map<int, gtsam::Point3> landmarkEstimates_; // map id -> optimized position
+	size_t nextLandmark_;
 	gtsam::NavState state_;
 	gtsam::imuBias::ConstantBias bias_;
 	Stats stats_;
+};
+
+/**
+ * Local map of OdometryVIO: 3D points of the stereo tracks with their ORB
+ * descriptor. The new tracks of a keyframe are matched to the map points not
+ * tracked anymore, which become landmarks of the back-end.
+ */
+class VIOLocalMap
+{
+public:
+	VIOLocalMap(const ParametersMap & parameters);
+	~VIOLocalMap();
+
+	void reset();
+	size_t size() const {return points_.size();}
+
+	/**
+	 * Before a keyframe: matches the new tracks to the map.
+	 * @param image Left image (grayscale or BGR).
+	 * @param imuPose Predicted IMU pose in world.
+	 * @param imuToCamera Pose of the left camera (optical frame) in the IMU frame.
+	 * @param imuToBase Pose of the base frame in the IMU frame.
+	 * @return Landmarks observed by the tracks (track id -> landmark).
+	 */
+	std::map<int, VIOBackend::Landmark> match(
+			const cv::Mat & image,
+			const std::vector<VIOFrontend::Track> & tracks,
+			const StereoCameraModel & model,
+			const gtsam::Pose3 & imuPose,
+			const gtsam::Pose3 & imuToCamera,
+			const gtsam::Pose3 & imuToBase);
+
+	/**
+	 * After a keyframe was optimized: adds the new tracks to the map and
+	 * updates the points.
+	 */
+	void update(
+			double stamp,
+			const std::vector<VIOFrontend::Track> & tracks,
+			const gtsam::Pose3 & imuPose,
+			const gtsam::Pose3 & imuToBase,
+			const std::map<int, gtsam::Point3> & landmarkEstimates);
+
+	int lastMatches() const {return lastMatches_;}
+
+private:
+	struct Point
+	{
+		gtsam::Point3 world;
+		cv::Mat descriptor;
+		int observations;
+		double depth;    // stereo depth when created (m)
+		double lastSeen; // stamp
+	};
+
+	double sigma_;
+	double radius_;
+	int maxDescDistance_;
+	int maxSize_;
+	double depthNoise_; // pixel noise / (fx * baseline)
+	cv::Ptr<cv::Feature2D> orb_;
+
+	std::map<int, Point> points_;
+	int nextId_;
+	std::map<int, int> trackToPoint_;  // track id -> map id, tracks that created or re-found their point
+	std::set<int> refound_;            // tracks that re-found an older point
+	std::map<int, cv::Mat> newDescriptors_; // track id -> descriptor, tracks not in the map yet
+	int lastMatches_;
 };
 
 }

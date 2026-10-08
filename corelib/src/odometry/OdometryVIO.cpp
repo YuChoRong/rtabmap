@@ -57,6 +57,8 @@ struct OdometryVIO::Impl
 	double lastImuStamp = 0.0;
 	Eigen::Vector3d lastAcc = Eigen::Vector3d::Zero();
 	Eigen::Vector3d lastOmega = Eigen::Vector3d::Zero();
+	// IMU samples received after initialization, not integrated yet (stamp, acc, gyro)
+	std::deque<std::pair<double, std::pair<Eigen::Vector3d, Eigen::Vector3d> > > imuQueue;
 	// Initialization: last IMU samples (stamp, acc, gyro)
 	std::deque<std::pair<double, std::pair<Eigen::Vector3d, Eigen::Vector3d> > > initSamples;
 	// Stereo images before initialization: stamp, track positions and 3D points (base frame)
@@ -64,6 +66,7 @@ struct OdometryVIO::Impl
 	StereoCameraModel initModel;
 	std::pair<double, double> initMotionStamps; // images of the last camera motion computed
 	double initMotion = -1.0;
+	int initFilterSamples = 1;
 	double initMaxAccStd = 0.0;
 	double initMaxGyroStd = 0.0;
 	double initMaxGyroBias = 0.0;
@@ -74,9 +77,40 @@ struct OdometryVIO::Impl
 	std::unique_ptr<VIOFrontend> frontend;
 #ifdef RTABMAP_GTSAM_UNSTABLE
 	std::unique_ptr<VIOBackend> backend;
+	std::unique_ptr<VIOLocalMap> localMap; // null if disabled
 	bool backendStarted = false; // the back-end has been initialized at least once since clear()
 #endif
 	double keyframeInterval = 0.0;
+
+	// Integrates the queued IMU samples up to stamp, interpolating the
+	// sample at stamp when it falls between two samples.
+	void integrateImu(double stamp)
+	{
+		while(!imuQueue.empty() && lastImuStamp < stamp)
+		{
+			double t = imuQueue.front().first;
+			Eigen::Vector3d acc = imuQueue.front().second.first;
+			Eigen::Vector3d omega = imuQueue.front().second.second;
+			if(t > stamp)
+			{
+				double ratio = (stamp - lastImuStamp) / (t - lastImuStamp);
+				acc = lastAcc + ratio * (acc - lastAcc);
+				omega = lastOmega + ratio * (omega - lastOmega);
+				t = stamp;
+			}
+			else
+			{
+				imuQueue.pop_front();
+			}
+#ifdef RTABMAP_GTSAM
+			// Midpoint between the two samples bounding the interval
+			preintegrated->integrateMeasurement(0.5*(lastAcc+acc), 0.5*(lastOmega+omega), t - lastImuStamp);
+#endif
+			lastImuStamp = t;
+			lastAcc = acc;
+			lastOmega = omega;
+		}
+	}
 
 	void clear()
 	{
@@ -87,6 +121,7 @@ struct OdometryVIO::Impl
 #endif
 		initialized = false;
 		lastImuStamp = 0.0;
+		imuQueue.clear();
 		initSamples.clear();
 		initImages.clear();
 		initMotionStamps = std::make_pair(0.0, 0.0);
@@ -103,6 +138,10 @@ struct OdometryVIO::Impl
 		{
 			backend->reset();
 		}
+		if(localMap)
+		{
+			localMap->reset();
+		}
 		backendStarted = false;
 #endif
 	}
@@ -118,14 +157,23 @@ OdometryVIO::OdometryVIO(const ParametersMap & parameters) :
 	impl_->frontend.reset(new VIOFrontend(parameters));
 #ifdef RTABMAP_GTSAM_UNSTABLE
 	impl_->backend.reset(new VIOBackend(parameters));
+	bool localMap = Parameters::defaultOdomVIOLocalMap();
+	Parameters::parse(parameters, Parameters::kOdomVIOLocalMap(), localMap);
+	if(localMap)
+	{
+		impl_->localMap.reset(new VIOLocalMap(parameters));
+	}
 #endif
 	impl_->keyframeInterval = Parameters::defaultOdomVIOKeyframeInterval();
 	Parameters::parse(parameters, Parameters::kOdomVIOKeyframeInterval(), impl_->keyframeInterval);
 	UASSERT(impl_->keyframeInterval >= 0.0);
+	impl_->initFilterSamples = Parameters::defaultOdomVIOInitFilterSamples();
 	impl_->initMaxAccStd = Parameters::defaultOdomVIOInitMaxAccStd();
 	impl_->initMaxGyroStd = Parameters::defaultOdomVIOInitMaxGyroStd();
 	impl_->initMaxGyroBias = Parameters::defaultOdomVIOInitMaxGyroBias();
 	impl_->initMaxMotion = Parameters::defaultOdomVIOInitMaxMotion();
+	Parameters::parse(parameters, Parameters::kOdomVIOInitFilterSamples(), impl_->initFilterSamples);
+	UASSERT(impl_->initFilterSamples >= 1);
 	Parameters::parse(parameters, Parameters::kOdomVIOInitMaxGyroBias(), impl_->initMaxGyroBias);
 	Parameters::parse(parameters, Parameters::kOdomVIOInitMaxAccStd(), impl_->initMaxAccStd);
 	Parameters::parse(parameters, Parameters::kOdomVIOInitMaxGyroStd(), impl_->initMaxGyroStd);
@@ -183,6 +231,19 @@ double stdDev(const std::vector<Eigen::Vector3d> & v, Eigen::Vector3d & mean)
 	double sum = 0.0;
 	for(size_t i=0; i<v.size(); ++i) sum += (v[i]-mean).squaredNorm();
 	return std::sqrt(sum / (double)v.size());
+}
+
+// Means of consecutive groups of n samples (low-pass filter against vibrations)
+std::vector<Eigen::Vector3d> groupMeans(const std::vector<Eigen::Vector3d> & v, int n)
+{
+	std::vector<Eigen::Vector3d> means;
+	for(size_t i=0; i+n<=v.size(); i+=n)
+	{
+		Eigen::Vector3d mean = Eigen::Vector3d::Zero();
+		for(int j=0; j<n; ++j) mean += v[i+j];
+		means.push_back(mean / (double)n);
+	}
+	return means;
 }
 
 // Camera translation (m) between two images of the same tracks (PnP), -1 if it cannot be estimated
@@ -275,6 +336,11 @@ Transform OdometryVIO::computeTransform(
 					}
 				}
 			}
+			if(t.isNull() && info)
+			{
+				// Lost: callers read the covariance of every frame
+				info->reg.covariance = cv::Mat::eye(6, 6, CV_64FC1) * 9999.0;
+			}
 		}
 		else if(!data.imageRaw().empty())
 		{
@@ -319,9 +385,14 @@ Transform OdometryVIO::computeTransform(
 					accs[i] = d.initSamples[i].second.first;
 					gyros[i] = d.initSamples[i].second.second;
 				}
+				// Vibrations average out in groups of samples, motion does not
+				int groupSize = std::min(d.initFilterSamples, initImuSamples_);
 				Eigen::Vector3d accMean, gyroMean;
-				double accStd = stdDev(accs, accMean);
-				double gyroStd = stdDev(gyros, gyroMean);
+				double accStd = stdDev(groupMeans(accs, groupSize), accMean);
+				double gyroStd = stdDev(groupMeans(gyros, groupSize), gyroMean);
+				// Gravity and gyroscope bias from all samples (the groups may leave some out)
+				stdDev(accs, accMean);
+				stdDev(gyros, gyroMean);
 				// A constant rotation also has a low variance: the mean angular velocity must look like a bias
 				bool imuStill = accStd <= d.initMaxAccStd && gyroStd <= d.initMaxGyroStd && gyroMean.norm() <= d.initMaxGyroBias;
 				// With stereo images, the camera must not have moved since the start of the window
@@ -374,20 +445,27 @@ Transform OdometryVIO::computeTransform(
 		}
 		else
 		{
-			double dt = data.stamp() - d.lastImuStamp;
-			if(dt > 0.0)
+			// Integrated up to the stamp of the next image
+			if(data.stamp() > (d.imuQueue.empty()?d.lastImuStamp:d.imuQueue.back().first))
 			{
-				// Midpoint between the two samples bounding the interval
-				d.preintegrated->integrateMeasurement(0.5*(d.lastAcc+acc), 0.5*(d.lastOmega+omega), dt);
+				d.imuQueue.push_back(std::make_pair(data.stamp(), std::make_pair(acc, omega)));
+				// Without images, do not keep the samples forever
+				while(d.imuQueue.back().first - d.imuQueue.front().first > 1.0)
+				{
+					d.integrateImu(d.imuQueue.front().first);
+				}
 			}
 			else
 			{
-				UWARN("Ignoring IMU measurement with non-increasing stamp (dt=%f)", dt);
+				UWARN("Ignoring IMU measurement with non-increasing stamp (%f)", data.stamp());
 			}
 		}
-		d.lastImuStamp = data.stamp();
-		d.lastAcc = acc;
-		d.lastOmega = omega;
+		if(!d.initialized || d.lastImuStamp == 0.0)
+		{
+			d.lastImuStamp = data.stamp();
+			d.lastAcc = acc;
+			d.lastOmega = omega;
+		}
 	}
 
 	bool isImageFrame = !data.imageRaw().empty() ||
@@ -413,13 +491,23 @@ Transform OdometryVIO::computeTransform(
 			}
 			UWARN("VIO not initialized yet, waiting for the sensor to be static (%d/%d IMU samples)...",
 					(int)d.initSamples.size(), initImuSamples_);
+			if(info)
+			{
+				info->reg.covariance = cv::Mat::eye(6, 6, CV_64FC1) * 9999.0;
+			}
 			return t;
 		}
 
-		// Predict at the stamp of the last IMU sample received (IMU is expected
-		// to be fed before the image of the same time). d.state is the state
-		// where the pre-integration started: the last keyframe with the
-		// back-end, the last image frame otherwise.
+		// Predict at the stamp of the image (IMU is expected to be fed before
+		// the image of the same time, later samples stay queued). d.state is
+		// the state where the pre-integration started: the last keyframe with
+		// the back-end, the last image frame otherwise.
+		d.integrateImu(data.stamp());
+		if(d.lastImuStamp < data.stamp() - 0.01)
+		{
+			UWARN("Image at %f is %f s after the last IMU sample, the IMU should be fed before the image",
+					data.stamp(), data.stamp() - d.lastImuStamp);
+		}
 		gtsam::NavState predicted = d.preintegrated->predict(d.state, d.bias);
 		Eigen::Matrix<double, 15, 15> cov = d.preintegrated->preintMeasCov();
 		gtsam::NavState output = predicted;
@@ -445,9 +533,21 @@ Transform OdometryVIO::computeTransform(
 			if(keyframe)
 			{
 				bool success;
+				const gtsam::Pose3 imuToCamera((d.imuLocalTransformInv * model.left().localTransform()).toEigen4d());
+				const gtsam::Pose3 imuToBase(d.imuLocalTransformInv.toEigen4d());
+				std::map<int, VIOBackend::Landmark> landmarks;
+				if(d.localMap)
+				{
+					landmarks = d.localMap->match(data.imageRaw(), d.frontend->tracks(), model, predicted.pose(), imuToCamera, imuToBase);
+				}
 				if(!d.backend->initialized())
 				{
-					gtsam::Pose3 imuToCamera((d.imuLocalTransformInv * model.left().localTransform()).toEigen4d());
+					if(d.localMap && d.backendStarted)
+					{
+						// Restarting after a failure: the map is in the old frame
+						d.localMap->reset();
+						landmarks = d.localMap->match(data.imageRaw(), d.frontend->tracks(), model, predicted.pose(), imuToCamera, imuToBase);
+					}
 					// Static start: zero velocity. After a failure, the velocity is the IMU prediction.
 					double velocitySigma = d.backendStarted ? 1.0 : 0.01;
 					success = d.backend->initialize(data.stamp(), predicted, d.bias, imuToCamera, model,
@@ -456,12 +556,16 @@ Transform OdometryVIO::computeTransform(
 				}
 				else
 				{
-					success = d.backend->addKeyframe(data.stamp(), *d.preintegrated, predicted, d.frontend->tracks());
+					success = d.backend->addKeyframe(data.stamp(), *d.preintegrated, predicted, d.frontend->tracks(), landmarks);
 				}
 				if(success)
 				{
 					output = d.backend->state();
 					d.bias = d.backend->bias();
+					if(d.localMap)
+					{
+						d.localMap->update(data.stamp(), d.frontend->tracks(), output.pose(), imuToBase, d.backend->landmarkEstimates());
+					}
 				}
 				// else: keep the IMU prediction, the back-end restarts at the next keyframe
 			}
