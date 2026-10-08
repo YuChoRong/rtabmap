@@ -163,9 +163,10 @@ def main():
         # Rectified intrinsics and base -> camera transform of the left camera
         calib_dir = os.path.join(tmp, 'map_calib')
         first = min(cameras)
-        calib_file = os.path.join(calib_dir, '%d_left.yaml' % first)
-        if not os.path.exists(calib_file):
-            calib_file = os.path.join(calib_dir, sorted(os.listdir(calib_dir))[0])
+        # Stereo: <id>_left.yaml, RGB-D (e.g., RealSense color + depth): <id>.yaml, multi-camera: <id>_0.yaml
+        calib_file = next((os.path.join(calib_dir, n % first) for n in ('%d_left.yaml', '%d.yaml', '%d_0.yaml')
+                           if os.path.exists(os.path.join(calib_dir, n % first))),
+                          os.path.join(calib_dir, sorted(os.listdir(calib_dir))[0]))
         text = open(calib_file).read()
         width = int(re.search(r'image_width:\s*(\d+)', text).group(1))
         height = int(re.search(r'image_height:\s*(\d+)', text).group(1))
@@ -182,9 +183,11 @@ def main():
         os.makedirs(out_images, exist_ok=True)
         os.makedirs(out_sparse, exist_ok=True)
 
-        image_dir = os.path.join(tmp, 'map_left')
-        if not os.path.isdir(image_dir):
-            image_dir = os.path.join(tmp, 'map')
+        # Left image of a stereo camera, or color image of an RGB-D camera
+        image_dir = next((os.path.join(tmp, d) for d in ('map_left', 'map_rgb', 'map')
+                          if os.path.isdir(os.path.join(tmp, d))), None)
+        if image_dir is None:
+            sys.exit('No image exported from the database (were images saved in it?)')
         names = {}
         for fname in os.listdir(image_dir):
             stem = os.path.splitext(fname)[0]

@@ -8,7 +8,8 @@ Same features as colmap_viewer/ (C++), without any compilation.
 
 DIR: COLMAP folder with sparse/0/{cameras,images,points3D}.txt and images/
      (camera_poses.txt and gt_camera_poses.txt are read when present).
---gt: ground truth camera poses, TUM format "stamp x y z qx qy qz qw [id]".
+--gt: reference camera poses, TUM format "stamp x y z qx qy qz qw [id]": the ground truth,
+      or the SLAM poses to compare with an SfM model (run_colmap_sfm.py, use --scale and --ref-name SLAM).
 --screenshot: renders the window to a PNG, prints the statistics and exits.
 
 Dependencies: PySide6 (LGPL-3.0, PySide2 also works), numpy, Pillow (not needed by the viewer itself).
@@ -82,9 +83,12 @@ class Model:
         self.raw_gt = {}  # frame index -> (R, t)
         self.gt_path = ''
         self.stats = {}
+        self.ref_name = 'ground truth'
 
     def load(self, directory):
+        ref_name = getattr(self, 'ref_name', 'ground truth')
         self.__init__()
+        self.ref_name = ref_name
         self.dir = directory
         sparse = next((d for d in (os.path.join(directory, 'sparse', '0'), os.path.join(directory, 'sparse'), directory)
                        if os.path.exists(os.path.join(d, 'images.txt'))), None)
@@ -115,8 +119,10 @@ class Model:
         if not self.frames:
             raise RuntimeError('No image in images.txt')
         self.frames.sort(key=lambda f: (f['key'], f['name']) if f['key'] >= 0 else (1 << 30, f['name']))
-        poses_file = os.path.join(directory, 'camera_poses.txt')
-        if os.path.exists(poses_file):
+        # Stamps of the RTAB-Map export (slam_camera_poses.txt in a run_colmap_sfm.py folder)
+        poses_file = next((p for p in (os.path.join(directory, 'camera_poses.txt'), os.path.join(directory, 'slam_camera_poses.txt'))
+                           if os.path.exists(p)), '')
+        if poses_file:
             stamps = {p[3]: p[0] for p in read_tum(poses_file)}
             for f in self.frames:
                 f['stamp'] = stamps.get(f['key'], -1.0)
@@ -164,7 +170,8 @@ class Model:
             f = self.frames[k]
             f['gt_R'] = R @ self.raw_gt[k][0]
             f['gt_t'] = s * R @ self.raw_gt[k][1] + t
-            f['error'] = float(np.linalg.norm(f['gt_t'] - f['t']))
+            # In reference units (e.g., meters of the SLAM poses against an SfM model of arbitrary scale)
+            f['error'] = float(np.linalg.norm(f['gt_t'] - f['t'])) / s
             f['rot_error'] = rot_angle_deg(f['gt_R'].T @ f['R'])
             errors.append(f['error']); rot_errors.append(f['rot_error'])
             D_sum += f['gt_R'].T @ f['R']
@@ -283,7 +290,7 @@ class TrajectoryView(QtWidgets.QWidget):
                 p.setBrush(GT_COLOR)
                 p.setPen(Qt.NoPen)
                 p.drawEllipse(QtCore.QPointF(*self.screen(f['gt_t'])), 4, 4)
-        labels = ['estimate (COLMAP)', 'ground truth (aligned)' if self.model.raw_gt else 'no ground truth']
+        labels = ['estimate (COLMAP)', ('%s (aligned)' % self.model.ref_name) if self.model.raw_gt else 'no %s' % self.model.ref_name]
         x0 = w - max(p.fontMetrics().horizontalAdvance(l) for l in labels) - 45
         for k, (label, color) in enumerate(zip(labels, (EST_COLOR, GT_COLOR))):
             p.setPen(QtGui.QPen(color, 3))
@@ -338,7 +345,7 @@ class ErrorPlot(QtWidgets.QWidget):
         p.fillRect(self.rect(), self.palette().base())
         m = self.model
         if not m or not m.frames or not m.stats:
-            p.drawText(self.rect(), Qt.AlignCenter, 'Position error over time (needs ground truth)')
+            p.drawText(self.rect(), Qt.AlignCenter, 'Position error over time (needs a reference: %s)' % (m.ref_name if m else 'ground truth'))
             return
         p.setRenderHint(QtGui.QPainter.Antialiasing, True)
         r, s, xs = self.rect_(), m.stats, self.xs()
@@ -417,7 +424,7 @@ class ImageView(QtWidgets.QWidget):
                 p.drawRect(QtCore.QRectF(target.left() + u*s - 1, target.top() + v*s - 1, 2, 2))
         f = m.frames[self.index]
         info = '%s: %d points reprojected with the %s pose (red near, blue far)' % (
-            f['name'], len(self.proj), 'ground truth' if self.use_gt and f['gt_t'] is not None else 'estimated')
+            f['name'], len(self.proj), m.ref_name if self.use_gt and f['gt_t'] is not None else 'estimated')
         if f['gt_t'] is not None:
             info += '   error %.1f cm, %.2f deg' % (f['error']*100, f['rot_error'])
         p.setPen(self.palette().text().color())
@@ -438,7 +445,7 @@ class MainWindow(QtWidgets.QMainWindow):
         points, errors = QtWidgets.QCheckBox('Points'), QtWidgets.QCheckBox('Error lines')
         points.setChecked(True); errors.setChecked(True)
         self.scale = QtWidgets.QCheckBox('Align with scale')
-        reproject, gt_pose = QtWidgets.QCheckBox('Reprojected points'), QtWidgets.QCheckBox('Reproject with ground truth pose')
+        reproject, gt_pose = QtWidgets.QCheckBox('Reprojected points'), QtWidgets.QCheckBox('Reproject with reference pose')
         reproject.setChecked(True)
         self.slider = QtWidgets.QSlider(Qt.Horizontal)
         self.slider.setEnabled(False)
@@ -469,7 +476,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         menu = self.menuBar().addMenu('&File')
         for text, slot, key in (('Open COLMAP folder...', self.open_dialog, QtGui.QKeySequence.Open),
-                                ('Load ground truth...', self.gt_dialog, None),
+                                ('Load reference poses...', self.gt_dialog, None),
                                 ('Save screenshot...', self.screenshot_dialog, None),
                                 ('Quit', self.close, QtGui.QKeySequence.Quit)):
             action = menu.addAction(text)
@@ -529,7 +536,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self.open_folder(d)
 
     def gt_dialog(self):
-        path, _ = QtWidgets.QFileDialog.getOpenFileName(self, 'Ground truth camera poses (stamp x y z qx qy qz qw [id])',
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(self, 'Reference camera poses: ground truth or SLAM (stamp x y z qx qy qz qw [id])',
                                                         self.model.dir, 'Poses (*.txt *.csv);;All (*)')
         if path:
             self.open_gt(path)
@@ -554,20 +561,21 @@ class MainWindow(QtWidgets.QMainWindow):
         text = '<b>%s</b><br>%d images, %d points, camera %s %dx%d f=%.1f c=(%.1f, %.1f), path %.2f m' % (
             m.dir, len(m.frames), len(m.points), K['model'], K['width'], K['height'], K['fx'], K['cx'], K['cy'], m.path_length)
         if s:
-            text += ('<br>Ground truth: %s (%d matched)<br><b>Position error RMSE %.2f cm</b>, mean %.2f, median %.2f, '
-                     'max %.2f cm; scale estimate/GT %.4f (%s alignment)<br>Rotation error RMSE %.3f deg; '
+            text += ('<br>Reference (%s): %s (%d matched)<br><b>Position error RMSE %.2f cm</b>, mean %.2f, median %.2f, '
+                     'max %.2f cm (reference units); scale estimate/reference %.4f (%s alignment)<br>Rotation error RMSE %.3f deg; '
                      'constant camera frame offset %.2f deg, RMSE without it %.3f deg') % (
-                m.gt_path, s['matched'], s['rmse']*100, s['mean']*100, s['median']*100, s['max']*100, s['scale'],
+                m.ref_name, m.gt_path, s['matched'], s['rmse']*100, s['mean']*100, s['median']*100, s['max']*100, s['scale'],
                 'similarity' if self.scale.isChecked() else 'rigid', s['rot_rmse'], s['rot_offset'], s['rot_rmse_no_offset'])
         else:
-            text += '<br>No ground truth (File > Load ground truth, or gt_camera_poses.txt in the folder)'
+            text += '<br>No reference poses (File > Load reference poses, --gt FILE, or gt_camera_poses.txt in the folder)'
         self.stats.setText(text)
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('dir', nargs='?')
-    parser.add_argument('--gt')
+    parser.add_argument('--gt', help='Reference camera poses (ground truth, or SLAM poses to compare with an SfM model)')
+    parser.add_argument('--ref-name', default='ground truth', help='Name of the reference shown in the window, e.g. SLAM')
     parser.add_argument('--scale', action='store_true', help='Similarity alignment (with scale)')
     parser.add_argument('--frame', type=int, default=0)
     parser.add_argument('--plane', choices=['xy', 'xz', 'yz'], default='xy')
@@ -576,6 +584,7 @@ def main():
 
     app = QtWidgets.QApplication(sys.argv[:1])
     window = MainWindow()
+    window.model.ref_name = args.ref_name
     window.scale.setChecked(args.scale)
     window.plane.setCurrentIndex(['xy', 'xz', 'yz'].index(args.plane))
     if args.dir and not window.open_folder(args.dir) and args.screenshot:

@@ -76,6 +76,36 @@ can be redistributed.
 - The model is `3dgs/point_cloud.ply` (standard 3DGS PLY, e.g., SuperSplat).
 - `python3 train_gsplat.py colmap_out --check` checks the data without a GPU.
 
+## 4. Compare with an independent COLMAP SfM (no ground truth needed)
+
+In a real space without motion capture, a COLMAP Structure-from-Motion
+reconstruction of the same images is the reference:
+
+```bash
+python3 run_colmap_sfm.py colmap_out                    # -> colmap_out_sfm/
+python3 colmap_viewer.py colmap_out_sfm --gt colmap_out_sfm/slam_camera_poses.txt --ref-name SLAM --scale
+```
+
+`run_colmap_sfm.py` runs COLMAP (feature extraction, sequential or
+`--matcher exhaustive` matching, mapping) with the intrinsics of the
+rectified images fixed, and keeps the largest model in `colmap_out_sfm/sparse/0`.
+The SfM model has no metric scale, so the viewer aligns the SLAM poses with a
+similarity (`--scale`) and gives the errors in meters of the SLAM poses.
+COLMAP must be installed (https://colmap.github.io/install.html, Windows:
+`--colmap C:\COLMAP\COLMAP.bat`).
+
+Live test in your own space (Windows, Intel RealSense D435i):
+1. Record with the RTAB-Map Windows release (RealSense2 driver, RGB-D), walk
+   slowly with some loops, and save the database (`map.db`).
+2. `py rtabmap_to_colmap.py map.db live` (stereo and RGB-D databases are supported).
+3. `py run_colmap_sfm.py live --colmap C:\COLMAP\COLMAP.bat`
+4. `colmap_viewer.bat live_sfm --gt live_sfm\slam_camera_poses.txt --ref-name SLAM --scale`
+
+License: COLMAP is BSD-3, but its GPU SIFT (SiftGPU) is non-profit only and
+its LSD module is AGPL. The script always uses the CPU SIFT and COLMAP is
+only used as an external tool (not redistributed). A clean COLMAP binary is
+built with `-DCUDA_ENABLED=OFF -DOPENGL_ENABLED=OFF -DLSD_ENABLED=OFF -DCGAL_ENABLED=OFF`.
+
 ## Windows
 
 Tested parts: the Python scripts are platform independent, the C++ viewer
