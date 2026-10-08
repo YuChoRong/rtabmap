@@ -9,6 +9,8 @@
 
 namespace {
 
+const double kRadToDeg = 180.0 / 3.14159265358979323846; // M_PI is not defined by MSVC
+
 Pose fromTum(double x, double y, double z, double qx, double qy, double qz, double qw)
 {
 	Pose p;
@@ -290,7 +292,7 @@ void ColmapModel::align(bool withScale)
 		f.gt.t = scale * R * it.second.t + t;
 		f.error = (f.gt.t - f.estimate.t).norm();
 		Eigen::AngleAxisd aa(f.gt.R.transpose() * f.estimate.R);
-		f.rotError = std::fabs(aa.angle()) * 180.0 / M_PI;
+		f.rotError = std::fabs(aa.angle()) * kRadToDeg;
 		errors.push_back(f.error);
 		s.rmse += f.error * f.error;
 		s.mean += f.error;
@@ -313,12 +315,12 @@ void ColmapModel::align(bool withScale)
 		S(2,2) = -1;
 		D = svd.matrixU() * S * svd.matrixV().transpose();
 	}
-	s.rotOffset = std::fabs(Eigen::AngleAxisd(D).angle()) * 180.0 / M_PI;
+	s.rotOffset = std::fabs(Eigen::AngleAxisd(D).angle()) * kRadToDeg;
 	double rotSumNoOffset = 0;
 	for(const auto & it : rawGt_)
 	{
 		const Frame & f = frames_[it.first];
-		double a = std::fabs(Eigen::AngleAxisd((f.gt.R * D).transpose() * f.estimate.R).angle()) * 180.0 / M_PI;
+		double a = std::fabs(Eigen::AngleAxisd((f.gt.R * D).transpose() * f.estimate.R).angle()) * kRadToDeg;
 		rotSumNoOffset += a * a;
 	}
 	s.rotRmseNoOffset = std::sqrt(rotSumNoOffset / n);

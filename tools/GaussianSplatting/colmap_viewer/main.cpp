@@ -19,7 +19,9 @@
 #include <QSlider>
 #include <QSplitter>
 #include <QStatusBar>
+#include <QRegularExpression>
 #include <QVBoxLayout>
+#include <functional>
 #include <iostream>
 
 class MainWindow : public QMainWindow
@@ -85,21 +87,27 @@ public:
 		resize(1500, 900);
 
 		QMenu * file = menuBar()->addMenu("&File");
-		file->addAction("Open COLMAP folder...", this, [this]() {
+		// Same menu API in Qt5 and Qt6
+		auto addAction = [this](QMenu * menu, const QString & text, std::function<void()> slot, QKeySequence shortcut = QKeySequence()) {
+			QAction * action = menu->addAction(text);
+			action->setShortcut(shortcut);
+			connect(action, &QAction::triggered, this, slot);
+		};
+		addAction(file, "Open COLMAP folder...", [this]() {
 			QString dir = QFileDialog::getExistingDirectory(this, "COLMAP folder (with sparse/0 and images)");
 			if(!dir.isEmpty()) openFolder(dir);
 		}, QKeySequence::Open);
-		file->addAction("Load ground truth...", this, [this]() {
+		addAction(file, "Load ground truth...", [this]() {
 			QString path = QFileDialog::getOpenFileName(this, "Ground truth camera poses (stamp x y z qx qy qz qw [id])",
 					model_.directory(), "Poses (*.txt *.csv);;All (*)");
 			if(!path.isEmpty()) openGroundTruth(path);
 		});
-		file->addAction("Save screenshot...", this, [this]() {
+		addAction(file, "Save screenshot...", [this]() {
 			QString path = QFileDialog::getSaveFileName(this, "Screenshot", "colmap_viewer.png", "PNG (*.png)");
 			if(!path.isEmpty()) grab().save(path);
 		});
 		file->addSeparator();
-		file->addAction("Quit", this, &QWidget::close, QKeySequence::Quit);
+		addAction(file, "Quit", [this]() {close();}, QKeySequence::Quit);
 
 		connect(plane_, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this](int i) {
 			trajectory_->setPlane((TrajectoryView::Plane)i);
@@ -248,7 +256,7 @@ int main(int argc, char ** argv)
 		app.processEvents();
 		window.grab().save(screenshot);
 		QString stats = window.statsText();
-		stats.replace("<br>", "\n").remove(QRegExp("<[^>]*>"));
+		stats.replace("<br>", "\n").remove(QRegularExpression("<[^>]*>"));
 		std::cout << stats.toStdString() << std::endl;
 		return 0;
 	}

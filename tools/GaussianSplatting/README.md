@@ -5,6 +5,8 @@ closures), the rectified images and the stereo point cloud are exported as a
 COLMAP model, a 3D Gaussian Splatting model is trained on it, and
 `colmap_viewer` checks the model and compares the poses with the ground truth.
 
+Linux and Windows are supported; Windows steps are in [Windows](#windows).
+
 ## 1. Export the map to COLMAP
 
 ```bash
@@ -66,3 +68,36 @@ can be redistributed.
   render images in `3dgs/renders`.
 - The model is `3dgs/point_cloud.ply` (standard 3DGS PLY, e.g., SuperSplat).
 - `python3 train_gsplat.py colmap_out --check` checks the data without a GPU.
+
+## Windows
+
+Tested parts: the Python scripts are platform independent, the viewer builds
+with Qt5 and Qt6, and the PowerShell script was checked with PowerShell 7.
+
+1. **Export** (only if you have your own RTAB-Map database; skip with a
+   provided `colmap_*.zip`, extract it with `Expand-Archive colmap_v101.zip .`):
+   ```powershell
+   py rtabmap_to_colmap.py map.db colmap_out   # finds C:\Program Files\RTABMap\bin\rtabmap-export.exe
+   ```
+2. **Train** (NVIDIA GPU, Python 3.10-3.12 from python.org):
+   ```powershell
+   .\train_3dgs.ps1 -Data colmap_v101 -Cuda cu124          # PowerShell
+   train_3dgs.bat colmap_v101 -Cuda cu124 -Factor 2         # or cmd.exe
+   ```
+   The first run creates `.gs_env`, installs PyTorch for `-Cuda` (cu118,
+   cu121, cu124, cu126: pick one supported by your driver, see `nvidia-smi`)
+   and a pre-compiled gsplat wheel from https://docs.gsplat.studio/whl. When
+   no wheel matches, gsplat compiles its CUDA code at the first run: install
+   Visual Studio Build Tools (Desktop development with C++) and the CUDA
+   Toolkit of the same version, and run from the "x64 Native Tools Command
+   Prompt". If PowerShell blocks the script, use `train_3dgs.bat` or
+   `powershell -ExecutionPolicy Bypass -File train_3dgs.ps1 ...`.
+3. **Viewer** (Visual Studio 2019/2022 with C++, CMake):
+   - with [vcpkg](https://github.com/microsoft/vcpkg): `vcpkg install qtbase eigen3 --triplet x64-windows`,
+     `set VCPKG_ROOT=C:\vcpkg`, then `build_viewer_windows.bat`;
+   - or with the Qt online installer (LGPL, MSVC 64-bit kit) and the Eigen
+     sources: `set QT_DIR=C:\Qt\6.8.0\msvc2022_64`, `set EIGEN_DIR=C:\eigen-3.4.0`,
+     then `build_viewer_windows.bat`.
+
+   Run `colmap_viewer\build\Release\colmap_viewer.exe colmap_v101`. Qt is
+   linked dynamically (LGPL), its DLLs are copied next to the executable.

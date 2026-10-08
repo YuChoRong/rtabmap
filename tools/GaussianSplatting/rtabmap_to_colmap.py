@@ -122,11 +122,26 @@ def read_ply_vertices(path):
     return points
 
 
+def find_rtabmap_export():
+    """rtabmap-export in PATH, else in the default install folders (Windows installer, /usr/local)."""
+    found = shutil.which('rtabmap-export')
+    if found:
+        return found
+    candidates = [os.path.join(os.environ.get(v, ''), 'RTABMap', 'bin', 'rtabmap-export.exe')
+                  for v in ('ProgramFiles', 'ProgramFiles(x86)') if os.environ.get(v)]
+    candidates.append('/usr/local/bin/rtabmap-export')
+    for c in candidates:
+        if os.path.exists(c):
+            return c
+    return 'rtabmap-export'
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('database')
     parser.add_argument('output')
-    parser.add_argument('--rtabmap-export', default=shutil.which('rtabmap-export') or 'rtabmap-export')
+    parser.add_argument('--rtabmap-export', default=find_rtabmap_export(),
+                        help='rtabmap-export executable (e.g., C:/Program Files/RTABMap/bin/rtabmap-export.exe)')
     parser.add_argument('--voxel', type=float, default=0.02, help='Voxel size (m) of the initial point cloud.')
     parser.add_argument('--max-points', type=int, default=200000, help='Random subset of the initial points (0 = all).')
     args = parser.parse_args()
@@ -136,7 +151,10 @@ def main():
         cmd = [args.rtabmap_export, '--poses_camera', '--poses_gt', '--poses_format', '11', '--images_id',
                '--cloud', '--voxel', str(args.voxel), '--output', 'map', '--output_dir', tmp, args.database]
         print(' '.join(cmd))
-        subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL)
+        try:
+            subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL)
+        except FileNotFoundError:
+            sys.exit('rtabmap-export not found: install RTAB-Map or give its path with --rtabmap-export')
 
         cameras = read_poses(os.path.join(tmp, 'map_camera_poses.txt'))
         if not cameras:
