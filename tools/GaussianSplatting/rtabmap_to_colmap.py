@@ -9,7 +9,7 @@ stereo point cloud, then writes:
   OUT/sparse/0/cameras.txt      PINHOLE model of the rectified left camera
   OUT/sparse/0/images.txt       world -> camera poses (COLMAP convention)
   OUT/sparse/0/points3D.txt     initial points (no tracks)
-  OUT/sparse/0/points3D.ply     same points, read directly by the Inria 3DGS code
+  OUT/sparse/0/points3D.ply     same points as a PLY file
   OUT/gt_camera_poses.txt       ground truth camera poses (stamp x y z qx qy qz qw id)
   OUT/camera_poses.txt          estimated camera poses, same format
 

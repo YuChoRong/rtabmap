@@ -48,11 +48,16 @@ of the camera optical frame, matched by id (image name) or by stamp (needs
 ## 3. Train 3D Gaussian Splatting (CUDA GPU)
 
 ```bash
+pip install gsplat && pip install -r ~/gsplat/examples/requirements.txt  # once, with PyTorch installed
 ./train_3dgs.sh colmap_out colmap_out/3dgs
 ```
 
-Uses [graphdeco-inria/gaussian-splatting](https://github.com/graphdeco-inria/gaussian-splatting)
-(cloned to `~/gaussian-splatting` if missing; set up its conda environment
-first). Grayscale images are converted to RGB, every 8th image is kept for
-evaluation, and PSNR / SSIM / LPIPS are printed at the end. The model is
-`colmap_out/3dgs/point_cloud/iteration_30000/point_cloud.ply`.
+Uses [gsplat](https://github.com/nerfstudio-project/gsplat) (Apache-2.0,
+`simple_trainer.py` of its examples, cloned to `~/gsplat` if missing).
+Grayscale images are converted to RGB, every 8th image is kept for
+evaluation (PSNR / SSIM / LPIPS in `colmap_out/3dgs/stats`), and the model is
+saved as a `.ply` in `colmap_out/3dgs/ply`.
+
+The Inria reference implementation (graphdeco-inria/gaussian-splatting) is
+not used: its license only allows non-commercial research and evaluation.
+Optional gsplat features have their own licenses (e.g., `--post_processing ppisp`).
