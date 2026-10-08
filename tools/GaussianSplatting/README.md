@@ -48,16 +48,21 @@ of the camera optical frame, matched by id (image name) or by stamp (needs
 ## 3. Train 3D Gaussian Splatting (CUDA GPU)
 
 ```bash
-pip install gsplat && pip install -r ~/gsplat/examples/requirements.txt  # once, with PyTorch installed
-./train_3dgs.sh colmap_out colmap_out/3dgs
+pip install torch gsplat numpy pillow   # once (train_3dgs.sh installs them when missing)
+./train_3dgs.sh colmap_out [colmap_out/3dgs] [--steps 30000] [--factor 2]
 ```
 
-Uses [gsplat](https://github.com/nerfstudio-project/gsplat) (Apache-2.0,
-`simple_trainer.py` of its examples, cloned to `~/gsplat` if missing).
-Grayscale images are converted to RGB, every 8th image is kept for
-evaluation (PSNR / SSIM / LPIPS in `colmap_out/3dgs/stats`), and the model is
-saved as a `.ply` in `colmap_out/3dgs/ply`.
+`train_gsplat.py` is a self-contained trainer built only on the
+[gsplat](https://github.com/nerfstudio-project/gsplat) rasterizer and
+densification strategy (Apache-2.0); it does not use the Inria reference code,
+whose license forbids commercial use and redistribution outside research.
+All dependencies (torch BSD-3, gsplat Apache-2.0, numpy BSD-3, Pillow MIT-CMU)
+can be redistributed.
 
-The Inria reference implementation (graphdeco-inria/gaussian-splatting) is
-not used: its license only allows non-commercial research and evaluation.
-Optional gsplat features have their own licenses (e.g., `--post_processing ppisp`).
+- Gaussians start at the RTAB-Map stereo points, images are loaded as RGB
+  (grayscale is fine), loss 0.8 L1 + 0.2 (1 - SSIM), gsplat `DefaultStrategy`
+  densification, spherical harmonics up to degree 3.
+- Every 8th image is held out: PSNR / SSIM in `3dgs/stats.json`, ground truth |
+  render images in `3dgs/renders`.
+- The model is `3dgs/point_cloud.ply` (standard 3DGS PLY, e.g., SuperSplat).
+- `python3 train_gsplat.py colmap_out --check` checks the data without a GPU.
