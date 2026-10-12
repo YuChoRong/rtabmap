@@ -200,7 +200,15 @@ OdometryVIO::OdometryVIO(const ParametersMap & parameters) :
 	impl_->params->biasAccCovariance = gtsam::I_3x3 * accBiasNoise * accBiasNoise;
 	impl_->params->biasOmegaCovariance = gtsam::I_3x3 * gyroBiasNoise * gyroBiasNoise;
 	impl_->params->integrationCovariance = gtsam::I_3x3 * 1e-8;
+#if GTSAM_VERSION_NUMERIC >= 40300
+	// GTSAM 4.3 no longer adds biasAccOmegaInt to the preintegration covariance.
+	// In 4.2 it entered exactly like extra accelerometer/gyroscope white noise
+	// (same Jacobians), so add it there to keep the tuned behavior.
+	impl_->params->accelerometerCovariance += gtsam::I_3x3 * 1e-5;
+	impl_->params->gyroscopeCovariance += gtsam::I_3x3 * 1e-5;
+#else
 	impl_->params->biasAccOmegaInt = gtsam::I_6x6 * 1e-5;
+#endif
 #endif
 	Parameters::parse(parameters, Parameters::kOdomVIOInitImuSamples(), initImuSamples_);
 	UASSERT(initImuSamples_ >= 1);
