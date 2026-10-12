@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Converts an Intel RealSense Viewer recording (.bag) of a D435i to the EuRoC
+"""Converts an Intel RealSense Viewer recording (.bag or .db3) of a D435i to the EuRoC
 folder layout read by rtabmap-euroc_dataset (stereo IR + IMU, our VIO).
 
   pip install rosbags numpy opencv-python-headless      (rosbags: Apache-2.0)
@@ -25,6 +25,7 @@ import argparse, os, sys
 from pathlib import Path
 import numpy as np
 import cv2
+import sqlite3
 from rosbags.highlevel import AnyReader
 from rosbags.typesys import Stores, get_typestore
 
@@ -43,6 +44,46 @@ def quat2rot_rs(q):
     return np.array([[1 - 2*y*y - 2*z*z, 2*x*y - 2*z*w, 2*x*z + 2*y*w],
                      [2*x*y + 2*z*w, 1 - 2*x*x - 2*z*z, 2*y*z - 2*x*w],
                      [2*x*z - 2*y*w, 2*y*z + 2*x*w, 1 - 2*x*x - 2*y*y]])
+
+
+class BagSource:
+    """Messages of a RealSense recording: ROS1 .bag, rosbag2 folder, or a bare
+    rosbag2 .db3 file (newer RealSense Viewer versions, no metadata.yaml)."""
+
+    def __init__(self, path):
+        self.path = Path(path)
+        self.db = None
+        self.reader = None
+
+    def __enter__(self):
+        if self.path.suffix == '.db3':
+            self.store = get_typestore(Stores.ROS2_HUMBLE)
+            self.db = sqlite3.connect(str(self.path))
+            rows = self.db.execute('SELECT id, name, type FROM topics').fetchall()
+            self.ids = {name: (i, typ) for i, name, typ in rows}
+            self.topics = set(self.ids)
+        else:
+            store = get_typestore(Stores.ROS1_NOETIC if self.path.suffix == '.bag' else Stores.ROS2_HUMBLE)
+            self.reader = AnyReader([self.path], default_typestore=store).__enter__()
+            self.conns = {c.topic: c for c in self.reader.connections}
+            self.topics = set(self.conns)
+        return self
+
+    def __exit__(self, *exc):
+        if self.db:
+            self.db.close()
+        if self.reader:
+            self.reader.__exit__(*exc)
+
+    def messages(self, topic):
+        """Deserialized messages of a topic, in recording order."""
+        if self.db:
+            tid, typ = self.ids[topic]
+            for (data,) in self.db.execute('SELECT data FROM messages WHERE topic_id=? ORDER BY timestamp', (tid,)):
+                yield self.store.deserialize_cdr(bytes(data), typ)
+        else:
+            for conn, _, raw in self.reader.messages(connections=[self.conns[topic]]):
+                yield self.reader.deserialize(raw, conn.msgtype)
 
 
 def image_to_numpy(msg):
@@ -77,9 +118,8 @@ def main():
     args = parser.parse_args()
 
     out = Path(args.output) / 'mav0'
-    store = get_typestore(Stores.ROS1_NOETIC)
-    with AnyReader([Path(args.bag)], default_typestore=store) as reader:
-        topics = {c.topic: c for c in reader.connections}
+    with BagSource(args.bag) as reader:
+        topics = reader.topics
         def find(suffix, contains):
             hits = [t for t in topics if t.endswith(suffix) and contains in t]
             return hits[0] if hits else None
@@ -93,8 +133,8 @@ def main():
         def first(topic):
             if topic not in topics:
                 return None
-            for conn, _, raw in reader.messages(connections=[topics[topic]]):
-                return reader.deserialize(raw, conn.msgtype)
+            for m in reader.messages(topic):
+                return m
 
         def info(img_topic):
             m = first(img_topic.replace('/image/data', '/info/camera_info'))
@@ -139,8 +179,7 @@ def main():
 
         # Stereo pairs
         def stamps_and_msgs(topic):
-            for conn, _, raw in reader.messages(connections=[topics[topic]]):
-                m = reader.deserialize(raw, conn.msgtype)
+            for m in reader.messages(topic):
                 yield stamp_ns(m.header), m
         right = {s: m for s, m in stamps_and_msgs(ir2)}
         right_stamps = np.array(sorted(right))

@@ -1,12 +1,14 @@
 # Test only: writes a RealSense-Viewer-like bag from EuRoC (rectified stereo + IMU in camera-like axes)
 import sys, numpy as np, cv2, yaml
 from pathlib import Path
-from rosbags.rosbag1 import Writer
+from rosbags.rosbag1 import Writer as Writer1
+from rosbags.rosbag2 import Writer as Writer2
 from rosbags.typesys import Stores, get_typestore
 from scipy.spatial.transform import Rotation as Rot
 
 seq, bag, seconds = Path(sys.argv[1]) / 'mav0', Path(sys.argv[2]), float(sys.argv[3])
-ts = get_typestore(Stores.ROS1_NOETIC)
+ros2 = bag.suffix != '.bag'  # otherwise a rosbag2 folder (sqlite3 .db3 inside), like newer RealSense Viewers
+ts = get_typestore(Stores.ROS2_HUMBLE if ros2 else Stores.ROS1_NOETIC)
 Image, Imu, CameraInfo = ts.types['sensor_msgs/msg/Image'], ts.types['sensor_msgs/msg/Imu'], ts.types['sensor_msgs/msg/CameraInfo']
 Header, Time = ts.types['std_msgs/msg/Header'], ts.types['builtin_interfaces/msg/Time']
 Transform, V3, Q = ts.types['geometry_msgs/msg/Transform'], ts.types['geometry_msgs/msg/Vector3'], ts.types['geometry_msgs/msg/Quaternion']
@@ -36,24 +38,30 @@ def tf(T):
     q = Rot.from_matrix(T[:3, :3]).as_quat()
     return Transform(translation=V3(x=T[0, 3], y=T[1, 3], z=T[2, 3]), rotation=Q(x=q[0], y=q[1], z=q[2], w=q[3]))
 def hdr(ns, i=0):
-    return Header(seq=i, stamp=Time(sec=int(ns // 1000000000), nanosec=int(ns % 1000000000)), frame_id='')
+    t = Time(sec=int(ns // 1000000000), nanosec=int(ns % 1000000000))
+    return Header(stamp=t, frame_id='') if ros2 else Header(seq=i, stamp=t, frame_id='')
 def caminfo(ns):
-    return CameraInfo(header=hdr(ns), height=480, width=752, distortion_model='Brown Conrady', D=np.zeros(5), K=K.ravel().astype(float),
-                      R=np.eye(3).ravel(), P=np.hstack([K, np.zeros((3, 1))]).ravel(), binning_x=0, binning_y=0,
-                      roi=RoiT(x_offset=0, y_offset=0, height=0, width=0, do_rectify=False))
+    m = dict(D=np.zeros(5), K=K.ravel().astype(float), R=np.eye(3).ravel(), P=np.hstack([K, np.zeros((3, 1))]).ravel())
+    if ros2:
+        m = {k.lower(): v for k, v in m.items()}
+    return CameraInfo(header=hdr(ns), height=480, width=752, distortion_model='Brown Conrady', binning_x=0, binning_y=0,
+                      roi=RoiT(x_offset=0, y_offset=0, height=0, width=0, do_rectify=False), **m)
 
 stamps = [int(l.split(',')[0]) for l in open(seq / 'cam0/data.csv') if not l.startswith('#')]
 t0 = stamps[0]; stamps = [s for s in stamps if s - t0 <= seconds * 1e9]
 P = '/device_0/sensor_0/'; M = '/device_0/sensor_2/'
-bag.unlink(missing_ok=True)
-with Writer(bag) as w:
+if ros2:
+    import shutil; shutil.rmtree(bag, ignore_errors=True)
+else:
+    bag.unlink(missing_ok=True)
+with (Writer2(bag, version=8) if ros2 else Writer1(bag)) as w:
     c = {}
     def conn(topic, typ):
         if topic not in c:
             c[topic] = w.add_connection(topic, typ, typestore=ts)
         return c[topic]
     def put(topic, typ, ns, msg):
-        w.write(conn(topic, typ), ns, ts.serialize_ros1(msg, typ))
+        w.write(conn(topic, typ), ns, ts.serialize_cdr(msg, typ) if ros2 else ts.serialize_ros1(msg, typ))
     put(P + 'Infrared_1/info/camera_info', 'sensor_msgs/msg/CameraInfo', t0, caminfo(t0))
     put(P + 'Infrared_2/info/camera_info', 'sensor_msgs/msg/CameraInfo', t0, caminfo(t0))
     put(P + 'Infrared_1/tf/0', 'geometry_msgs/msg/Transform', t0, tf(np.eye(4)))

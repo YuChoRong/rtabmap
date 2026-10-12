@@ -3,7 +3,7 @@ rem Processes a RealSense Viewer recording of a D435i (IR stereo + IMU) with our
 rem SLAM with ORB and with ALIKED+LightGlue loop closures, then exports to COLMAP.
 rem
 rem   call C:\slam\install\rtabmap_env.bat
-rem   tools\Windows\process_d435i.bat recording.bag [out_dir] [C:\COLMAP\COLMAP.bat]
+rem   tools\Windows\process_d435i.bat recording.bag (or .db3) [out_dir] [C:\COLMAP\COLMAP.bat]
 rem
 rem The COLMAP SfM comparison runs only when the COLMAP path is given.
 setlocal

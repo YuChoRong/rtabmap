@@ -1,6 +1,7 @@
 # Intel RealSense D435i recordings with our VIO
 
-`realsense_bag_to_euroc.py` converts a RealSense Viewer recording (`.bag`) to
+`realsense_bag_to_euroc.py` converts a RealSense Viewer recording (`.bag`, or `.db3`
+from newer Viewer versions) to
 the EuRoC layout, so it can be processed by `rtabmap-euroc_dataset` with our
 VIO (`--Odom/Strategy 15`, stereo IR + IMU), with or without ALIKED/LightGlue.
 
