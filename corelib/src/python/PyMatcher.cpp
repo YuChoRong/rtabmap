@@ -251,7 +251,7 @@ std::vector<cv::DMatch> PyMatcher::match(
 						matches.push_back(cv::DMatch(c_out[i], c_out[i+1], 0));
 					}
 				}
-				if(type == NPY_INT64)
+				else if(type == NPY_INT64)
 				{
 					unsigned long long* c_out = reinterpret_cast<unsigned long long*>(PyArray_DATA(np_ret));
 					for (int i = 0; i < len1*len2; i+=2)
