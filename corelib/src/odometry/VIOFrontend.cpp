@@ -149,6 +149,20 @@ bool VIOFrontend::process(
 		left = l;
 		right = r;
 	}
+	else
+	{
+		// Stereo matching (KLT) assumes the same brightness in both images: when
+		// the exposures differ (e.g., right image ~40% darker on EuRoC
+		// V2_03_difficult), scale the right image to the mean of the left one.
+		double meanLeft = cv::mean(left)[0];
+		double meanRight = cv::mean(right)[0];
+		if(meanRight > 1.0 && std::fabs(meanLeft/meanRight - 1.0) > 0.2)
+		{
+			cv::Mat r;
+			right.convertTo(r, CV_8U, meanLeft/meanRight);
+			right = r;
+		}
+	}
 
 	stats_ = Stats();
 	previousCorners_.clear();
