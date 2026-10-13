@@ -78,6 +78,7 @@ public:
 		int pnpInliers = 0;   ///< PnP inliers.
 		int added = 0;        ///< New tracks detected in this frame.
 		int stereo = 0;       ///< Tracks with a stereo depth.
+		float stereoRowOffset = 0.0f; ///< Estimated vertical offset (pixels) of the right image matches (rectification error).
 	};
 
 public:
@@ -138,6 +139,7 @@ private:
 	cv::Mat previousLeft_;
 	std::vector<Track> tracks_;
 	int nextId_;
+	float stereoRowOffset_;
 	std::vector<cv::Point2f> previousCorners_;
 	std::vector<cv::Point2f> currentCorners_;
 	std::vector<int> cornerInliers_;
