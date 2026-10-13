@@ -34,7 +34,10 @@ R_EUROC_FROM_RS = np.array([[0., -1., 0.], [1., 0., 0.], [0., 0., 1.]])
 
 
 def stamp_ns(header):
-    return int(header.stamp.sec) * 1000000000 + int(header.stamp.nanosec)
+    s = int(header.stamp.sec) * 1000000000 + int(header.stamp.nanosec)
+    # Newer viewers stamp from the start of the recording; rtabmap-euroc_dataset
+    # expects at least 10 digits (seconds + 9 digits of nanoseconds)
+    return s + 10**18 if s < 10**15 else s
 
 
 def quat2rot_rs(q):
@@ -84,6 +87,21 @@ class BagSource:
         else:
             for conn, _, raw in self.reader.messages(connections=[self.conns[topic]]):
                 yield self.reader.deserialize(raw, conn.msgtype)
+
+
+def string_fields(msg):
+    """key=value fields of the std_msgs/String metadata written by newer RealSense
+    Viewers (e.g. "width=848;height=480;fx=..." or "rotation=...;translation=..."),
+    None for typed messages."""
+    data = getattr(msg, 'data', None)
+    if not isinstance(data, str):
+        return None
+    fields = {}
+    for item in data.split(';'):
+        if '=' in item:
+            k, v = item.split('=', 1)
+            fields[k.strip()] = v.strip()
+    return fields
 
 
 def image_to_numpy(msg):
@@ -137,7 +155,15 @@ def main():
                 return m
 
         def info(img_topic):
-            m = first(img_topic.replace('/image/data', '/info/camera_info'))
+            # sensor_msgs/CameraInfo next to the images (newer viewers), else .../info/camera_info
+            m = first(img_topic.replace('/image/data', '/image/camera_info'))
+            if m is None:
+                m = first(img_topic.replace('/image/data', '/info/camera_info'))
+            f = string_fields(m)
+            if f is not None:
+                K = np.array([[float(f['fx']), 0, float(f['ppx'])], [0, float(f['fy']), float(f['ppy'])], [0, 0, 1]])
+                D = np.array([float(v) for v in f.get('coeffs', '0,0,0,0,0').split(',')])
+                return K, D, (int(f['width']), int(f['height']))
             K = np.array(m.k if hasattr(m, 'k') else m.K, dtype=float).reshape(3, 3)
             D = np.array(m.d if hasattr(m, 'd') else m.D, dtype=float)
             return K, D, (m.width, m.height)
@@ -150,6 +176,12 @@ def main():
                 return None
             m = first(tf[0])
             T = np.eye(4)
+            f = string_fields(m)
+            if f is not None:
+                # rs2_extrinsics as text: column-major rotation, then translation
+                T[:3, :3] = np.array([float(v) for v in f['rotation'].split(',')]).reshape(3, 3).T
+                T[:3, 3] = [float(v) for v in f['translation'].split(',')]
+                return T
             T[:3, :3] = quat2rot_rs(m.rotation)
             T[:3, 3] = [m.translation.x, m.translation.y, m.translation.z]
             return T
