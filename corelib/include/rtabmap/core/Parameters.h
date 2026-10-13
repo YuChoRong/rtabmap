@@ -726,6 +726,7 @@ class RTABMAP_CORE_EXPORT Parameters
     RTABMAP_PARAM(OdomVIO, InitMaxGyroStd,   double, 0.02,      "Maximum standard deviation (rad/s) of the gyroscope samples of a static window.");
     RTABMAP_PARAM(OdomVIO, InitMaxGyroBias,  double, 0.1,       "Maximum norm (rad/s) of the mean angular velocity of a static window (the expected gyroscope bias range), so that a constant rotation is not taken as static.");
     RTABMAP_PARAM(OdomVIO, InitMaxMotion,    double, 0.005,     "With stereo images, maximum camera translation (m) over a static window, estimated by PnP between its first and last images (an IMU cannot tell constant velocity from no motion).");
+    RTABMAP_PARAM(OdomVIO, InitDynamicWindow, double, 1.0,     "With stereo images, length (s) of the window of stereo visual odometry poses aligned with the IMU to initialize while moving (gravity, velocity and biases), when the sensor does not start static. Not tried while the images do not move (the static initialization is used then). 0 disables the dynamic initialization.");
     RTABMAP_PARAM(OdomVIO, VisualOnly,       bool,   false,     "Ignore IMU data and output the stereo visual odometry of the front-end (PnP between consecutive frames). Used to validate the visual front-end.");
     RTABMAP_PARAM(OdomVIO, MaxFeatures,      int,    350,       "Maximum number of tracked features. New GFTT corners are detected when tracks are lost.");
     RTABMAP_PARAM(OdomVIO, MinFeatureDistance, double, 15.0,    "Minimum distance (pixels) between tracked features.");

@@ -37,6 +37,11 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include <gtsam/navigation/CombinedImuFactor.h>
 #include <gtsam/navigation/NavState.h>
 #include <gtsam/navigation/ImuBias.h>
+#include <gtsam/inference/Symbol.h>
+#include <gtsam/nonlinear/NonlinearFactorGraph.h>
+#include <gtsam/nonlinear/LevenbergMarquardtOptimizer.h>
+#include <gtsam/slam/BetweenFactor.h>
+#include <gtsam/slam/PriorFactor.h>
 #endif
 #ifdef RTABMAP_GTSAM_UNSTABLE
 #include "VIOBackend.h"
@@ -71,6 +76,11 @@ struct OdometryVIO::Impl
 	double initMaxGyroStd = 0.0;
 	double initMaxGyroBias = 0.0;
 	double initMaxMotion = 0.0;
+	// Dynamic initialization: IMU samples and stereo visual odometry poses (base frame) of the window
+	double initDynamicWindow = 0.0;
+	std::deque<std::pair<double, std::pair<Eigen::Vector3d, Eigen::Vector3d> > > dynamicSamples;
+	std::deque<std::pair<double, Transform> > dynamicPoses;
+	double initVelocitySigma = 0.01; // velocity prior of the back-end start
 	Transform imuLocalTransform;     // base -> imu
 	Transform imuLocalTransformInv;  // imu -> base
 	Transform previousPoseInv;       // inverse of last base pose returned
@@ -126,6 +136,9 @@ struct OdometryVIO::Impl
 		initImages.clear();
 		initMotionStamps = std::make_pair(0.0, 0.0);
 		initMotion = -1.0;
+		dynamicSamples.clear();
+		dynamicPoses.clear();
+		initVelocitySigma = 0.01;
 		imuLocalTransform.setNull();
 		imuLocalTransformInv.setNull();
 		previousPoseInv.setNull();
@@ -178,6 +191,9 @@ OdometryVIO::OdometryVIO(const ParametersMap & parameters) :
 	Parameters::parse(parameters, Parameters::kOdomVIOInitMaxAccStd(), impl_->initMaxAccStd);
 	Parameters::parse(parameters, Parameters::kOdomVIOInitMaxGyroStd(), impl_->initMaxGyroStd);
 	Parameters::parse(parameters, Parameters::kOdomVIOInitMaxMotion(), impl_->initMaxMotion);
+	impl_->initDynamicWindow = Parameters::defaultOdomVIOInitDynamicWindow();
+	Parameters::parse(parameters, Parameters::kOdomVIOInitDynamicWindow(), impl_->initDynamicWindow);
+	UASSERT(impl_->initDynamicWindow >= 0.0);
 	Parameters::parse(parameters, Parameters::kOdomVIOVisualOnly(), visualOnly_);
 #ifdef RTABMAP_GTSAM
 	double accNoise = Parameters::defaultOdomVIOAccNoise();
@@ -309,6 +325,193 @@ void fillFrontendInfo(const VIOFrontend & frontend, OdometryInfo * info)
 	}
 }
 
+
+#ifdef RTABMAP_GTSAM
+typedef std::deque<std::pair<double, std::pair<Eigen::Vector3d, Eigen::Vector3d> > > ImuSamples;
+
+// IMU sample (acc, gyro) at a stamp, interpolated between the samples around it
+std::pair<Eigen::Vector3d, Eigen::Vector3d> imuSampleAt(const ImuSamples & samples, double stamp)
+{
+	UASSERT(!samples.empty());
+	if(stamp <= samples.front().first)
+	{
+		return samples.front().second;
+	}
+	for(size_t i=1; i<samples.size(); ++i)
+	{
+		if(samples[i].first >= stamp)
+		{
+			double ratio = (stamp - samples[i-1].first) / (samples[i].first - samples[i-1].first);
+			return std::make_pair(
+					samples[i-1].second.first + ratio * (samples[i].second.first - samples[i-1].second.first),
+					samples[i-1].second.second + ratio * (samples[i].second.second - samples[i-1].second.second));
+		}
+	}
+	return samples.back().second;
+}
+
+// Pre-integrates the samples between two stamps (midpoint integration, as OdometryVIO::Impl::integrateImu())
+void preintegrate(const ImuSamples & samples, double from, double to, gtsam::PreintegratedCombinedMeasurements & preintegrated)
+{
+	double t = from;
+	std::pair<Eigen::Vector3d, Eigen::Vector3d> last = imuSampleAt(samples, from);
+	for(size_t i=0; i<=samples.size() && t < to; ++i)
+	{
+		double next = i < samples.size() ? std::min(samples[i].first, to) : to;
+		if(next <= t)
+		{
+			continue;
+		}
+		std::pair<Eigen::Vector3d, Eigen::Vector3d> sample = next < to && i < samples.size() ? samples[i].second : imuSampleAt(samples, to);
+		preintegrated.integrateMeasurement(0.5*(last.first+sample.first), 0.5*(last.second+sample.second), next - t);
+		t = next;
+		last = sample;
+	}
+}
+
+// Dynamic initialization: aligns a window of stereo visual odometry poses
+// (base frame, metric but in an arbitrary frame) with the IMU pre-integrated
+// between them. The unknowns are the IMU states (gravity direction, velocity)
+// and the biases. Returns the state and bias at the last pose.
+bool alignVisualInertial(
+		const std::deque<std::pair<double, Transform> > & poses,
+		const ImuSamples & samples,
+		const decltype(gtsam::PreintegrationCombinedParams::MakeSharedU()) & params,
+		const Transform & imuLocalTransform, // base -> imu
+		double maxGyroBias,
+		gtsam::NavState & state,
+		gtsam::imuBias::ConstantBias & bias)
+{
+	using gtsam::symbol_shorthand::X;
+	using gtsam::symbol_shorthand::V;
+	using gtsam::symbol_shorthand::B;
+
+	// Keyframes at least 0.1 s apart, the last pose included
+	std::vector<size_t> keyframes(1, poses.size()-1);
+	for(int i=(int)poses.size()-2; i>=0; --i)
+	{
+		if(poses[keyframes.back()].first - poses[i].first >= 0.1 - 1e-6)
+		{
+			keyframes.push_back(i);
+		}
+	}
+	std::reverse(keyframes.begin(), keyframes.end());
+	if(keyframes.size() < 5 || samples.empty() ||
+	   samples.front().first > poses[keyframes.front()].first ||
+	   samples.back().first < poses[keyframes.back()].first - 0.01)
+	{
+		return false;
+	}
+
+	// IMU poses in the visual odometry frame
+	std::vector<Eigen::Isometry3d> imuPoses(keyframes.size());
+	for(size_t k=0; k<keyframes.size(); ++k)
+	{
+		imuPoses[k] = Eigen::Isometry3d((poses[keyframes[k]].second * imuLocalTransform).toEigen4d());
+	}
+	const double duration = poses[keyframes.back()].first - poses[keyframes.front()].first;
+
+	// Gravity direction (up) in the first IMU frame: mean specific force minus
+	// the mean acceleration seen by the visual odometry
+	Eigen::Vector3d meanForce = Eigen::Vector3d::Zero();
+	int count = 0;
+	for(size_t i=0; i<samples.size(); ++i)
+	{
+		double t = samples[i].first;
+		if(t < poses[keyframes.front()].first || t > poses[keyframes.back()].first)
+		{
+			continue;
+		}
+		// rotation of the closest keyframe (the rotation is small between keyframes)
+		size_t k = 0;
+		while(k+1 < keyframes.size() && poses[keyframes[k+1]].first <= t) ++k;
+		meanForce += imuPoses[0].linear().transpose() * imuPoses[k].linear() * samples[i].second.first;
+		++count;
+	}
+	if(count == 0)
+	{
+		return false;
+	}
+	meanForce /= (double)count;
+	std::vector<Eigen::Vector3d> velocities(keyframes.size()); // first IMU frame
+	for(size_t k=0; k<keyframes.size(); ++k)
+	{
+		size_t a = k>0?k-1:k, b = k+1<keyframes.size()?k+1:k;
+		double dt = poses[keyframes[b]].first - poses[keyframes[a]].first;
+		velocities[k] = imuPoses[0].linear().transpose() * (imuPoses[b].translation() - imuPoses[a].translation()) / dt;
+	}
+	Eigen::Vector3d up = (meanForce - (velocities.back() - velocities.front()) / duration).normalized();
+
+	// World frame: z up, origin and yaw of the base at the first keyframe (as the static initialization)
+	gtsam::Rot3 R_wi(Eigen::Quaterniond::FromTwoVectors(up, Eigen::Vector3d::UnitZ()));
+	Transform baseRotation = Transform::fromEigen4d(gtsam::Pose3(R_wi, gtsam::Point3(0,0,0)).matrix()) * imuLocalTransform.inverse().rotation();
+	R_wi = gtsam::Rot3::Rz(-baseRotation.theta()) * R_wi;
+	const Eigen::Isometry3d worldFromVo = Eigen::Isometry3d(gtsam::Pose3(R_wi, gtsam::Point3(0,0,0)).matrix()) * imuPoses[0].inverse();
+
+	gtsam::NonlinearFactorGraph graph;
+	gtsam::Values values;
+	// Gauge: position and yaw of the first keyframe. Roll and pitch are free,
+	// the IMU observes them (rotation tangent in the body frame).
+	Eigen::Vector3d g = R_wi.transpose() * Eigen::Vector3d::UnitZ();
+	gtsam::Matrix6 information = gtsam::Matrix6::Zero();
+	information.block<3,3>(0,0) = g*g.transpose() / (0.001*0.001) + (Eigen::Matrix3d::Identity() - g*g.transpose()) / (1.0*1.0);
+	information.block<3,3>(3,3) = Eigen::Matrix3d::Identity() / (0.001*0.001);
+	gtsam::Vector6 biasSigmas;
+	biasSigmas << 0.2, 0.2, 0.2, 0.05, 0.05, 0.05; // acc (m/s^2), gyro (rad/s)
+	// Stereo visual odometry between keyframes 0.1 s apart
+	gtsam::Vector6 odomSigmas;
+	odomSigmas << 0.01, 0.01, 0.01, 0.02, 0.02, 0.02; // rot (rad), pos (m)
+
+	for(size_t k=0; k<keyframes.size(); ++k)
+	{
+		gtsam::Pose3 pose((worldFromVo * imuPoses[k]).matrix());
+		values.insert(X(k), pose);
+		values.insert(V(k), gtsam::Vector3(R_wi.matrix() * velocities[k]));
+		values.insert(B(k), gtsam::imuBias::ConstantBias());
+		if(k == 0)
+		{
+			graph.emplace_shared<gtsam::PriorFactor<gtsam::Pose3> >(X(0), pose, gtsam::noiseModel::Gaussian::Information(information));
+			graph.emplace_shared<gtsam::PriorFactor<gtsam::imuBias::ConstantBias> >(B(0), gtsam::imuBias::ConstantBias(), gtsam::noiseModel::Diagonal::Sigmas(biasSigmas));
+		}
+		else
+		{
+			gtsam::Pose3 relative((imuPoses[k-1].inverse() * imuPoses[k]).matrix());
+			graph.emplace_shared<gtsam::BetweenFactor<gtsam::Pose3> >(X(k-1), X(k), relative, gtsam::noiseModel::Diagonal::Sigmas(odomSigmas));
+			gtsam::PreintegratedCombinedMeasurements preintegrated(params, gtsam::imuBias::ConstantBias());
+			preintegrate(samples, poses[keyframes[k-1]].first, poses[keyframes[k]].first, preintegrated);
+			graph.emplace_shared<gtsam::CombinedImuFactor>(X(k-1), V(k-1), X(k), V(k), B(k-1), B(k), preintegrated);
+		}
+	}
+
+	gtsam::Values result;
+	try
+	{
+		gtsam::LevenbergMarquardtParams lmParams;
+		lmParams.maxIterations = 30;
+		result = gtsam::LevenbergMarquardtOptimizer(graph, values, lmParams).optimize();
+	}
+	catch(const std::exception & e)
+	{
+		UWARN("Dynamic initialization failed: %s", e.what());
+		return false;
+	}
+
+	// Consistency: chi2 of the IMU and visual odometry factors, plausible biases
+	double chi2 = 2.0 * graph.error(result) / (double)(keyframes.size()-1);
+	size_t last = keyframes.size()-1;
+	bias = result.at<gtsam::imuBias::ConstantBias>(B(last));
+	state = gtsam::NavState(result.at<gtsam::Pose3>(X(last)), result.at<gtsam::Vector3>(V(last)));
+	double tilt = gtsam::Rot3::Logmap(R_wi.between(result.at<gtsam::Pose3>(X(0)).rotation())).norm();
+	bool accepted = chi2 < 50.0 && bias.accelerometer().norm() < 0.5 && bias.gyroscope().norm() < maxGyroBias;
+	UINFO("Dynamic initialization over %.2f s (%d keyframes): %s (chi2/keyframe=%f, gravity correction=%f deg, "
+			"acc bias=(%f,%f,%f), gyro bias=(%f,%f,%f), speed=%f m/s)",
+			duration, (int)keyframes.size(), accepted?"accepted":"rejected", chi2, tilt*180.0/M_PI,
+			bias.accelerometer()[0], bias.accelerometer()[1], bias.accelerometer()[2],
+			bias.gyroscope()[0], bias.gyroscope()[1], bias.gyroscope()[2], state.v().norm());
+	return accepted;
+}
+#endif
+
 } // namespace
 
 // return not null transform if odometry is correctly computed
@@ -381,6 +584,14 @@ Transform OdometryVIO::computeTransform(
 			// constant velocity from no motion). The mean specific force then
 			// points up and the mean angular velocity is the gyroscope bias.
 			d.initSamples.push_back(std::make_pair(data.stamp(), std::make_pair(acc, omega)));
+			if(d.initDynamicWindow > 0.0)
+			{
+				d.dynamicSamples.push_back(d.initSamples.back());
+				while(d.dynamicSamples.front().first < data.stamp() - d.initDynamicWindow - 0.5)
+				{
+					d.dynamicSamples.pop_front();
+				}
+			}
 			while((int)d.initSamples.size() > initImuSamples_)
 			{
 				d.initSamples.pop_front();
@@ -481,13 +692,34 @@ Transform OdometryVIO::computeTransform(
 			!data.stereoCameraModels().empty();
 	if(isImageFrame)
 	{
+		bool tracked = false; // the frontend already processed this image
 		if(!d.initialized)
 		{
 			// Track the stereo images to know whether the camera is still
 			if(hasStereo(data))
 			{
-				d.frontend->process(data.imageRaw(), data.rightRaw(), data.stereoCameraModels()[0]);
+				bool hadPrevious = d.frontend->hasPrevious();
+				Transform motion;
+				bool ok = d.frontend->process(data.imageRaw(), data.rightRaw(), data.stereoCameraModels()[0], Transform(), &motion);
 				fillFrontendInfo(*d.frontend, info);
+				tracked = true;
+				if(d.initDynamicWindow > 0.0)
+				{
+					// Stereo visual odometry poses of the window, restarted when tracking fails
+					if(!ok || (hadPrevious && motion.isNull()))
+					{
+						d.dynamicPoses.clear();
+					}
+					else
+					{
+						d.dynamicPoses.push_back(std::make_pair(data.stamp(),
+								d.dynamicPoses.empty() || !hadPrevious ? Transform::getIdentity() : d.dynamicPoses.back().second * motion));
+						while(d.dynamicPoses.size() > 1 && d.dynamicPoses[1].first <= data.stamp() - d.initDynamicWindow + 1e-6)
+						{
+							d.dynamicPoses.pop_front();
+						}
+					}
+				}
 				d.initModel = data.stereoCameraModels()[0];
 				d.initImages.push_back(std::make_pair(data.stamp(), d.frontend->tracks()));
 				// Keep one image older than the IMU window (and a bounded history without IMU)
@@ -497,13 +729,53 @@ Transform OdometryVIO::computeTransform(
 					d.initImages.pop_front();
 				}
 			}
-			UWARN("VIO not initialized yet, waiting for the sensor to be static (%d/%d IMU samples)...",
-					(int)d.initSamples.size(), initImuSamples_);
-			if(info)
+			// Dynamic initialization when the images move over a full window
+			// (a still camera waits for the static initialization)
+			if(d.initDynamicWindow > 0.0 && !d.dynamicPoses.empty() &&
+			   d.dynamicPoses.back().first - d.dynamicPoses.front().first >= d.initDynamicWindow - 1e-6)
 			{
-				info->reg.covariance = cv::Mat::eye(6, 6, CV_64FC1) * 9999.0;
+				double maxMotion = 0.0, maxRotation = 0.0;
+				for(size_t i=1; i<d.dynamicPoses.size(); ++i)
+				{
+					Transform motion = d.dynamicPoses.front().second.inverse() * d.dynamicPoses[i].second;
+					maxMotion = std::max(maxMotion, (double)motion.getNorm());
+					maxRotation = std::max(maxRotation, (double)Eigen::AngleAxisf(motion.toEigen3f().linear()).angle());
+				}
+				if((maxMotion > 2.0*d.initMaxMotion || maxRotation > 2.0*M_PI/180.0) &&
+				   alignVisualInertial(d.dynamicPoses, d.dynamicSamples, d.params, d.imuLocalTransform,
+						   d.initMaxGyroBias, d.state, d.bias))
+				{
+					d.preintegrated.reset(new gtsam::PreintegratedCombinedMeasurements(d.params, d.bias));
+					d.initialized = true;
+					d.initVelocitySigma = 0.1;
+					std::pair<Eigen::Vector3d, Eigen::Vector3d> sample = imuSampleAt(d.dynamicSamples, data.stamp());
+					d.lastImuStamp = data.stamp();
+					d.lastAcc = sample.first;
+					d.lastOmega = sample.second;
+					d.imuQueue.clear();
+					for(size_t i=0; i<d.dynamicSamples.size(); ++i)
+					{
+						if(d.dynamicSamples[i].first > data.stamp())
+						{
+							d.imuQueue.push_back(d.dynamicSamples[i]);
+						}
+					}
+					d.initSamples.clear();
+					d.initImages.clear();
+					d.dynamicSamples.clear();
+					d.dynamicPoses.clear();
+				}
 			}
-			return t;
+			if(!d.initialized)
+			{
+				UWARN("VIO not initialized yet, waiting for the sensor to be static (%d/%d IMU samples)...",
+						(int)d.initSamples.size(), initImuSamples_);
+				if(info)
+				{
+					info->reg.covariance = cv::Mat::eye(6, 6, CV_64FC1) * 9999.0;
+				}
+				return t;
+			}
 		}
 
 		// Predict at the stamp of the image (IMU is expected to be fed before
@@ -530,8 +802,11 @@ Transform OdometryVIO::computeTransform(
 				motionGuess = d.previousPoseInv * Transform::fromEigen4d(predicted.pose().matrix()) * d.imuLocalTransformInv;
 			}
 			const StereoCameraModel & model = data.stereoCameraModels()[0];
-			d.frontend->process(data.imageRaw(), data.rightRaw(), model, motionGuess);
-			fillFrontendInfo(*d.frontend, info);
+			if(!tracked)
+			{
+				d.frontend->process(data.imageRaw(), data.rightRaw(), model, motionGuess);
+				fillFrontendInfo(*d.frontend, info);
+			}
 
 #ifdef RTABMAP_GTSAM_UNSTABLE
 			// (1e-6: stamps are large numbers, 1000.1-1000.0 < 0.1)
@@ -556,8 +831,8 @@ Transform OdometryVIO::computeTransform(
 						d.localMap->reset();
 						landmarks = d.localMap->match(data.imageRaw(), d.frontend->tracks(), model, predicted.pose(), imuToCamera, imuToBase);
 					}
-					// Static start: zero velocity. After a failure, the velocity is the IMU prediction.
-					double velocitySigma = d.backendStarted ? 1.0 : 0.01;
+					// Static start: zero velocity, dynamic start: aligned velocity. After a failure, the velocity is the IMU prediction.
+					double velocitySigma = d.backendStarted ? 1.0 : d.initVelocitySigma;
 					success = d.backend->initialize(data.stamp(), predicted, d.bias, imuToCamera, model,
 							d.frontend->tracks(), velocitySigma);
 					d.backendStarted = true;
