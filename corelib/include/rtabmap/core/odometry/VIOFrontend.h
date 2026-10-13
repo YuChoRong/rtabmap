@@ -120,11 +120,14 @@ private:
 private:
 	// parameters
 	int maxFeatures_;
+	int histogramEqualization_;
+	int gridCells_;
 	double minFeatureDistance_;
 	double featureQuality_;
 	int flowWinSize_;
 	int flowMaxLevel_;
 	double flowBackCheck_;
+	double stereoBackCheck_;
 	double fundamentalThreshold_;
 	double pnpReprojError_;
 	int pnpIterations_;

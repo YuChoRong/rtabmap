@@ -34,6 +34,7 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include <opencv2/imgproc/imgproc.hpp>
 #include <opencv2/video/tracking.hpp>
 #include <opencv2/calib3d/calib3d.hpp>
+#include <algorithm>
 #include <cmath>
 #include <limits>
 #include <map>
@@ -43,11 +44,14 @@ namespace rtabmap {
 
 VIOFrontend::VIOFrontend(const ParametersMap & parameters) :
 	maxFeatures_(Parameters::defaultOdomVIOMaxFeatures()),
+	histogramEqualization_(Parameters::defaultOdomVIOHistogramEqualization()),
+	gridCells_(Parameters::defaultOdomVIOGridCells()),
 	minFeatureDistance_(Parameters::defaultOdomVIOMinFeatureDistance()),
 	featureQuality_(Parameters::defaultOdomVIOFeatureQuality()),
 	flowWinSize_(Parameters::defaultOdomVIOFlowWinSize()),
 	flowMaxLevel_(Parameters::defaultOdomVIOFlowMaxLevel()),
 	flowBackCheck_(Parameters::defaultOdomVIOFlowBackCheck()),
+	stereoBackCheck_(Parameters::defaultOdomVIOStereoBackCheck()),
 	fundamentalThreshold_(Parameters::defaultOdomVIOFundamentalThreshold()),
 	pnpReprojError_(Parameters::defaultOdomVIOPnPReprojError()),
 	pnpIterations_(Parameters::defaultOdomVIOPnPIterations()),
@@ -56,16 +60,21 @@ VIOFrontend::VIOFrontend(const ParametersMap & parameters) :
 	nextId_(1)
 {
 	Parameters::parse(parameters, Parameters::kOdomVIOMaxFeatures(), maxFeatures_);
+	Parameters::parse(parameters, Parameters::kOdomVIOHistogramEqualization(), histogramEqualization_);
+	Parameters::parse(parameters, Parameters::kOdomVIOGridCells(), gridCells_);
 	Parameters::parse(parameters, Parameters::kOdomVIOMinFeatureDistance(), minFeatureDistance_);
 	Parameters::parse(parameters, Parameters::kOdomVIOFeatureQuality(), featureQuality_);
 	Parameters::parse(parameters, Parameters::kOdomVIOFlowWinSize(), flowWinSize_);
 	Parameters::parse(parameters, Parameters::kOdomVIOFlowMaxLevel(), flowMaxLevel_);
 	Parameters::parse(parameters, Parameters::kOdomVIOFlowBackCheck(), flowBackCheck_);
+	Parameters::parse(parameters, Parameters::kOdomVIOStereoBackCheck(), stereoBackCheck_);
 	Parameters::parse(parameters, Parameters::kOdomVIOFundamentalThreshold(), fundamentalThreshold_);
 	Parameters::parse(parameters, Parameters::kOdomVIOPnPReprojError(), pnpReprojError_);
 	Parameters::parse(parameters, Parameters::kOdomVIOPnPIterations(), pnpIterations_);
 	Parameters::parse(parameters, Parameters::kOdomVIOMinInliers(), minInliers_);
 	UASSERT(maxFeatures_ > 0);
+	UASSERT(histogramEqualization_ >= 0 && histogramEqualization_ <= 2);
+	UASSERT(gridCells_ >= 1);
 	UASSERT(minFeatureDistance_ >= 0.0);
 	UASSERT(featureQuality_ > 0.0);
 	UASSERT(flowWinSize_ >= 3);
@@ -120,6 +129,23 @@ bool VIOFrontend::process(
 	if(right.channels() > 1)
 	{
 		cv::cvtColor(rightIn, right, cv::COLOR_BGR2GRAY);
+	}
+	if(histogramEqualization_ == 1)
+	{
+		cv::Mat l, r;
+		cv::equalizeHist(left, l);
+		cv::equalizeHist(right, r);
+		left = l;
+		right = r;
+	}
+	else if(histogramEqualization_ == 2)
+	{
+		cv::Ptr<cv::CLAHE> clahe = cv::createCLAHE(2.0, cv::Size(8, 8));
+		cv::Mat l, r;
+		clahe->apply(left, l);
+		clahe->apply(right, r);
+		left = l;
+		right = r;
 	}
 
 	stats_ = Stats();
@@ -254,7 +280,8 @@ bool VIOFrontend::process(
 		}
 		else
 		{
-			UWARN("Not enough tracks with depth for PnP (%d, min=%d)", (int)words3A.size(), minInliers_);
+			UWARN("Not enough tracks with depth for PnP (%d, min=%d, tracked=%d/%d)",
+					(int)words3A.size(), minInliers_, stats_.tracked, (int)tracks_.size());
 		}
 
 		// Keep the inliers
@@ -313,7 +340,43 @@ void VIOFrontend::detectNewFeatures(const cv::Mat & image)
 		cv::circle(mask, tracks_[i].left, radius, cv::Scalar(0), -1);
 	}
 	std::vector<cv::Point2f> corners;
-	cv::goodFeaturesToTrack(image, corners, toAdd, featureQuality_, minFeatureDistance_, mask);
+	if(gridCells_ <= 1)
+	{
+		cv::goodFeaturesToTrack(image, corners, toAdd, featureQuality_, minFeatureDistance_, mask);
+	}
+	else
+	{
+		// Same share of features per cell: count the tracks already in each cell
+		const int cells = gridCells_ * gridCells_;
+		const int perCell = std::max(1, maxFeatures_ / cells);
+		std::vector<int> counts(cells, 0);
+		for(size_t i=0; i<tracks_.size(); ++i)
+		{
+			int cx = std::min(gridCells_-1, std::max(0, (int)(tracks_[i].left.x * gridCells_ / image.cols)));
+			int cy = std::min(gridCells_-1, std::max(0, (int)(tracks_[i].left.y * gridCells_ / image.rows)));
+			++counts[cy*gridCells_+cx];
+		}
+		for(int cy=0; cy<gridCells_; ++cy)
+		{
+			for(int cx=0; cx<gridCells_; ++cx)
+			{
+				int n = perCell - counts[cy*gridCells_+cx];
+				if(n <= 0)
+				{
+					continue;
+				}
+				cv::Rect roi(cx*image.cols/gridCells_, cy*image.rows/gridCells_,
+						(cx+1)*image.cols/gridCells_ - cx*image.cols/gridCells_,
+						(cy+1)*image.rows/gridCells_ - cy*image.rows/gridCells_);
+				std::vector<cv::Point2f> cellCorners;
+				cv::goodFeaturesToTrack(image(roi), cellCorners, n, featureQuality_, minFeatureDistance_, mask(roi));
+				for(size_t k=0; k<cellCorners.size(); ++k)
+				{
+					corners.push_back(cellCorners[k] + cv::Point2f((float)roi.x, (float)roi.y));
+				}
+			}
+		}
+	}
 	if(corners.empty())
 	{
 		return;
@@ -350,6 +413,36 @@ void VIOFrontend::computeDepth(const cv::Mat & left, const cv::Mat & right, cons
 	}
 	std::vector<unsigned char> status;
 	std::vector<cv::Point2f> rightPts = stereo_->computeCorrespondences(left, right, leftPts, status);
+	if(stereoBackCheck_ > 0.0 && rightPts.size() == leftPts.size())
+	{
+		const cv::Size winSize(flowWinSize_, flowWinSize_);
+		const cv::TermCriteria criteria(cv::TermCriteria::COUNT+cv::TermCriteria::EPS, 30, 0.01);
+		std::vector<float> err;
+		// Sub-pixel refinement of the matches (e.g., integer disparities of block matching)
+		std::vector<cv::Point2f> refined = rightPts;
+		std::vector<unsigned char> refinedStatus;
+		cv::calcOpticalFlowPyrLK(left, right, leftPts, refined, refinedStatus, err,
+				winSize, 0, criteria, cv::OPTFLOW_USE_INITIAL_FLOW);
+		// Left-right consistency: track the right correspondences back to the left image
+		std::vector<cv::Point2f> backPts = leftPts;
+		std::vector<unsigned char> backStatus;
+		cv::calcOpticalFlowPyrLK(right, left, refined, backPts, backStatus, err,
+				winSize, 0, criteria, cv::OPTFLOW_USE_INITIAL_FLOW);
+		for(size_t i=0; i<status.size(); ++i)
+		{
+			if(status[i] && refinedStatus[i] && backStatus[i] &&
+			   std::fabs(refined[i].y - leftPts[i].y) <= stereoBackCheck_ && // rectified images
+			   cv::norm(refined[i] - rightPts[i]) <= 2.0 * stereoBackCheck_ &&
+			   cv::norm(backPts[i] - leftPts[i]) <= stereoBackCheck_)
+			{
+				rightPts[i] = refined[i];
+			}
+			else
+			{
+				status[i] = 0;
+			}
+		}
+	}
 	int withDepth = 0;
 	for(size_t i=0; i<tracks_.size() && i<rightPts.size(); ++i)
 	{

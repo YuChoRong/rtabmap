@@ -724,7 +724,8 @@ TEST(VIOBackendTest, FollowsGroundTruthWithIdealMeasurements)
 	EXPECT_LT((backend.state().v() - truth.v()).norm(), 0.005);
 	EXPECT_LT(gtsam::Rot3::Logmap(backend.state().pose().rotation().between(truth.pose().rotation())).norm(), 0.001);
 	EXPECT_LT(backend.bias().vector().norm(), 0.01);
-	EXPECT_EQ(backend.stats().keyframes, 15); // keyframes newer than 1.5 s at 10 Hz
+	// keyframes newer than the window length
+	EXPECT_EQ(backend.stats().keyframes, (int)std::lround(Parameters::defaultOdomVIOWindowSize() / keyframeInterval));
 }
 #endif
 
@@ -795,3 +796,64 @@ TEST(OdometryVIOInitTest, ConstantVelocityIsNotTakenAsStatic)
 	std::cout << "Without the image check: first pose at t=" << imuOnlyFirst << " s" << std::endl;
 	EXPECT_LT(imuOnlyFirst, 0.0);
 }
+
+#ifdef RTABMAP_GTSAM_UNSTABLE
+// A map built from one view is found again by new tracks of the same view
+// (new track ids, as after the tracks were lost), with the right positions,
+// and not when the predicted pose is far from the true one.
+TEST(VIOLocalMapTest, RefindsPointsOfAPreviousView)
+{
+	cv::Mat left, right;
+	const Transform basePose = groundTruth(0.0);
+	renderStereo(basePose, left, right);
+	const StereoCameraModel model = stereoModel();
+	const gtsam::Pose3 imuPose(basePose.toEigen4d()); // IMU = base frame
+	const gtsam::Pose3 imuToBase;
+	const gtsam::Pose3 imuToCamera(model.left().localTransform().toEigen4d());
+
+	ParametersMap parameters;
+	VIOLocalMap localMap(parameters);
+	VIOFrontend frontend;
+	ASSERT_TRUE(frontend.process(left, right, model));
+	std::map<int, VIOBackend::Landmark> landmarks = localMap.match(left, frontend.tracks(), model, imuPose, imuToCamera, imuToBase);
+	EXPECT_TRUE(landmarks.empty());
+	localMap.update(0.0, frontend.tracks(), imuPose, imuToBase, std::map<int, gtsam::Point3>());
+	ASSERT_GT(localMap.size(), 100u);
+
+	// The same view with new tracks: all tracks are lost on a blank frame first
+	const cv::Mat blank(left.size(), left.type(), cv::Scalar::all(128));
+	VIOFrontend & frontend2 = frontend;
+	frontend2.process(blank, blank, model);
+	ASSERT_TRUE(frontend2.tracks().empty());
+	ASSERT_TRUE(frontend2.process(left, right, model));
+	landmarks = localMap.match(left, frontend2.tracks(), model, imuPose, imuToCamera, imuToBase);
+	std::cout << localMap.size() << " map points, " << landmarks.size() << " re-found" << std::endl;
+	EXPECT_GT(landmarks.size(), localMap.size() * 8 / 10);
+	int wrong = 0;
+	for(size_t i=0; i<frontend2.tracks().size(); ++i)
+	{
+		const VIOFrontend::Track & track = frontend2.tracks()[i];
+		std::map<int, VIOBackend::Landmark>::iterator iter = landmarks.find(track.id);
+		if(iter != landmarks.end())
+		{
+			// Same physical point: projects on the track (its stereo depth has errors along the ray)
+			gtsam::Point3 pc = (imuPose * imuToCamera).transformTo(iter->second.world);
+			cv::Point2f uv(kFocal*pc.x()/pc.z()+kCx, kFocal*pc.y()/pc.z()+kCy);
+			if(cv::norm(uv - track.left) > 2.0)
+			{
+				++wrong;
+			}
+			EXPECT_GT(iter->second.sigma, 0.0);
+		}
+	}
+	EXPECT_LE(wrong, (int)landmarks.size() / 50);
+
+	// Predicted 1 m away: nothing projects close to its point in 3D
+	VIOFrontend & frontend3 = frontend;
+	frontend3.process(blank, blank, model);
+	ASSERT_TRUE(frontend3.process(left, right, model));
+	gtsam::Pose3 farPose = imuPose * gtsam::Pose3(gtsam::Rot3(), gtsam::Point3(1.0, 0.0, 0.0));
+	landmarks = localMap.match(left, frontend3.tracks(), model, farPose, imuToCamera, imuToBase);
+	EXPECT_LT(landmarks.size(), 10u);
+}
+#endif
