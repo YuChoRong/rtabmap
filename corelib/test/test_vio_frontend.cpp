@@ -453,6 +453,7 @@ struct VioRunOptions
 	cv::Vec3d accBias = cv::Vec3d(0,0,0);
 	int blackoutBegin = -1; // frames [begin, end) are uniform gray
 	int blackoutEnd = -1;
+	double imuDelay = 0.0; // added to the IMU stamps (t_imu = t_camera + imuDelay)
 };
 
 struct VioRunResult
@@ -481,10 +482,13 @@ VioRunResult runVio(Odometry & odom, const VioRunOptions & options)
 		double stamp = 1000.0 + i / kImuRateVio;
 		if(options.input != kNoImu)
 		{
+			// Samples are received in stamp order: with a delay, the sample
+			// stamped now was measured imuDelay earlier
+			const int k = i - (int)std::lround(options.imuDelay * kImuRateVio);
 			cv::Vec3d gyro, acc;
-			imuAt(t, gyro, acc);
+			imuAt(-kStaticTime + k / kImuRateVio, gyro, acc);
 			SensorData imu;
-			imu.setStamp(stamp);
+			imu.setStamp(1000.0 + k / kImuRateVio + options.imuDelay);
 			imu.setIMU(IMU(gyro + options.gyroBias, cv::Mat::eye(3,3,CV_64FC1),
 					acc + options.accBias, cv::Mat::eye(3,3,CV_64FC1), kImuLocal));
 			odom.process(imu);
@@ -605,6 +609,42 @@ TEST(OdometryVIOFusionTest, FusionCorrectsImuBias)
 	EXPECT_EQ(fused.nullPoses, 0);
 	EXPECT_LT(fused.finalError, 0.01 * fused.pathLength);
 	EXPECT_LT(fused.finalError * 10.0, propagated.finalError);
+}
+
+TEST(OdometryVIOFusionTest, EstimatesTimeOffset)
+{
+	if(!backendAvailable()) GTEST_SKIP() << "RTAB-Map built without gtsam_unstable";
+
+	for(double delay : {-0.02, 0.02})
+	{
+		VioRunOptions options;
+		options.imuDelay = delay;
+
+		ParametersMap fixedParameters = vioParameters();
+		fixedParameters[Parameters::kOdomVIOEstimateTimeOffset()] = "false";
+		std::unique_ptr<Odometry> ignored(Odometry::create(fixedParameters));
+		VioRunResult ignoredResult = runVio(*ignored, options);
+
+		fixedParameters[Parameters::kOdomVIOTimeOffset()] = uNumber2Str(delay);
+		std::unique_ptr<Odometry> known(Odometry::create(fixedParameters));
+		VioRunResult knownResult = runVio(*known, options);
+
+		std::unique_ptr<Odometry> estimated(Odometry::create(vioParameters()));
+		VioRunResult estimatedResult = runVio(*estimated, options);
+		double offset = ((OdometryVIO*)estimated.get())->timeOffset();
+
+		std::cout << "IMU delay " << delay << " s, estimated " << offset << " s" << std::endl;
+		printResult("  offset ignored", ignoredResult);
+		printResult("  offset known", knownResult);
+		printResult("  offset estimated", estimatedResult);
+
+		EXPECT_NEAR(offset, delay, 0.003);
+		EXPECT_EQ(knownResult.nullPoses, 0);
+		EXPECT_EQ(estimatedResult.nullPoses, 0);
+		EXPECT_LT(knownResult.finalError, 0.6 * ignoredResult.finalError);
+		EXPECT_LT(knownResult.maxError, 0.005 * knownResult.pathLength);
+		EXPECT_LT(estimatedResult.maxError, 0.02 * estimatedResult.pathLength);
+	}
 }
 
 TEST(OdometryVIOFusionTest, BridgesVisualBlackout)
