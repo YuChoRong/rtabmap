@@ -131,7 +131,8 @@ class Model:
         centers = np.array([f['t'] for f in self.frames])
         self.path_length = float(np.linalg.norm(np.diff(centers, axis=0), axis=1).sum())
         gt_file = os.path.join(directory, 'gt_camera_poses.txt')
-        if os.path.exists(gt_file):
+        # Real spaces have no ground truth: rtabmap_to_colmap.py then writes an empty file
+        if os.path.exists(gt_file) and any(True for _ in data_lines(gt_file)):
             self.load_gt(gt_file)
 
     def load_gt(self, path):
