@@ -93,6 +93,14 @@ class Model:
         sparse = next((d for d in (os.path.join(directory, 'sparse', '0'), os.path.join(directory, 'sparse'), directory)
                        if os.path.exists(os.path.join(d, 'images.txt'))), None)
         if sparse is None:
+            # A parent folder was picked (e.g. the unzipped results folder): use the first subfolder with a model
+            for sub in sorted(os.listdir(directory)) if os.path.isdir(directory) else []:
+                d = os.path.join(directory, sub)
+                if os.path.exists(os.path.join(d, 'sparse', '0', 'images.txt')):
+                    directory, sparse = d, os.path.join(d, 'sparse', '0')
+                    self.dir = directory
+                    break
+        if sparse is None:
             raise RuntimeError('No images.txt in %s (text model expected: sparse/0/{cameras,images,points3D}.txt)' % directory)
         for v in data_lines(os.path.join(sparse, 'cameras.txt')):
             model, w, h, p = v[1], int(v[2]), int(v[3]), [float(x) for x in v[4:]]
