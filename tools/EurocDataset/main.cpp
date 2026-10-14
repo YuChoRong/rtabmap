@@ -64,6 +64,10 @@ void showUsage()
 			"  --disp             Generate full disparity.\n"
 			"  --raw              Use raw images (not rectified, this only works with okvis, msckf or vins odometry).\n"
 			"  --imu #            IMU filter: 0=madgwick, 1=complementary (default).\n"
+			"  --map \"path.db\"    Start from a copy of this map (e.g., with --Mem/IncrementalMemory false\n"
+			"                        to localize in it). Each processed frame is logged in\n"
+			"                        \"output_name\"_localization.txt: stamp, odometry pose and map pose\n"
+			"                        (x y z qx qy qz qw each) and the id of the node localized against (0: none).\n"
 			"%s\n"
 			"Example:\n\n"
 			"   $ rtabmap-euroc_dataset \\\n"
@@ -103,6 +107,7 @@ int main(int argc, char * argv[])
 	bool exposureCompensation = false;
 	bool quiet = false;
 	int imuFilter = 1;
+	std::string mapPath;
 	if(argc < 2)
 	{
 		showUsage();
@@ -134,6 +139,10 @@ int main(int argc, char * argv[])
 			else if(std::strcmp(argv[i], "--imu") == 0)
 			{
 				imuFilter = atoi(argv[++i]);
+			}
+			else if(std::strcmp(argv[i], "--map") == 0)
+			{
+				mapPath = uReplaceChar(argv[++i], '~', UDirectory::homeDir());
 			}
 			else if(std::strcmp(argv[i], "--exposure_comp") == 0)
 			{
@@ -320,6 +329,20 @@ int main(int argc, char * argv[])
 
 	std::string databasePath = output+"/"+outputName+".db";
 	UFile::erase(databasePath);
+	if(!mapPath.empty())
+	{
+		if(!UFile::exists(mapPath))
+		{
+			UERROR("Map \"%s\" doesn't exist!", mapPath.c_str());
+			return -1;
+		}
+		UFile::copy(mapPath, databasePath);
+	}
+	FILE * localizationLog = 0;
+	if(!mapPath.empty())
+	{
+		localizationLog = fopen((output+"/"+outputName+"_localization.txt").c_str(), "w");
+	}
 	if(cameraThread.camera()->init(output, outputName+"_calib"))
 	{
 		int totalImages = (int)((CameraStereoImages*)cameraThread.camera())->filenames().size();
@@ -509,6 +532,19 @@ int main(int argc, char * argv[])
 				OdometryEvent e(SensorData(), Transform(), odomInfo);
 				rtabmap.process(data, pose, covariance, e.velocity(), externalStats);
 				covariance = cv::Mat();
+				if(localizationLog && !pose.isNull())
+				{
+					Transform mapPose = rtabmap.getMapCorrection() * pose;
+					Eigen::Quaternionf qo = pose.getQuaternionf();
+					Eigen::Quaternionf qm = mapPose.getQuaternionf();
+					int localizedId = rtabmap.getLoopClosureId()>0?rtabmap.getLoopClosureId():
+							rtabmap.getStatistics().proximityDetectionId();
+					fprintf(localizationLog, "%f %f %f %f %f %f %f %f %f %f %f %f %f %f %f %d\n",
+							data.stamp(),
+							pose.x(), pose.y(), pose.z(), qo.x(), qo.y(), qo.z(), qo.w(),
+							mapPose.x(), mapPose.y(), mapPose.z(), qm.x(), qm.y(), qm.z(), qm.w(),
+							localizedId);
+				}
 			}
 
 			++iteration;
@@ -565,6 +601,10 @@ int main(int argc, char * argv[])
 			data = cameraThread.camera()->takeData(&cameraInfo);
 		}
 		delete odom;
+		if(localizationLog)
+		{
+			fclose(localizationLog);
+		}
 		printf("Total time=%fs\n", totalTime.ticks());
 		/////////////////////////////
 		// Processing dataset end

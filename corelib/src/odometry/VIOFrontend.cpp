@@ -57,7 +57,8 @@ VIOFrontend::VIOFrontend(const ParametersMap & parameters) :
 	pnpIterations_(Parameters::defaultOdomVIOPnPIterations()),
 	minInliers_(Parameters::defaultOdomVIOMinInliers()),
 	stereo_(Stereo::create(parameters)),
-	nextId_(1)
+	nextId_(1),
+	stereoRowOffset_(0.0f)
 {
 	Parameters::parse(parameters, Parameters::kOdomVIOMaxFeatures(), maxFeatures_);
 	Parameters::parse(parameters, Parameters::kOdomVIOHistogramEqualization(), histogramEqualization_);
@@ -92,6 +93,7 @@ void VIOFrontend::reset()
 {
 	previousLeft_ = cv::Mat();
 	tracks_.clear();
+	stereoRowOffset_ = 0.0f;
 	nextId_ = 1;
 	previousCorners_.clear();
 	currentCorners_.clear();
@@ -146,6 +148,20 @@ bool VIOFrontend::process(
 		clahe->apply(right, r);
 		left = l;
 		right = r;
+	}
+	else
+	{
+		// Stereo matching (KLT) assumes the same brightness in both images: when
+		// the exposures differ (e.g., right image ~40% darker on EuRoC
+		// V2_03_difficult), scale the right image to the mean of the left one.
+		double meanLeft = cv::mean(left)[0];
+		double meanRight = cv::mean(right)[0];
+		if(meanRight > 1.0 && std::fabs(meanLeft/meanRight - 1.0) > 0.2)
+		{
+			cv::Mat r;
+			right.convertTo(r, CV_8U, meanLeft/meanRight);
+			right = r;
+		}
 	}
 
 	stats_ = Stats();
@@ -428,12 +444,31 @@ void VIOFrontend::computeDepth(const cv::Mat & left, const cv::Mat & right, cons
 		std::vector<unsigned char> backStatus;
 		cv::calcOpticalFlowPyrLK(right, left, refined, backPts, backStatus, err,
 				winSize, 0, criteria, cv::OPTFLOW_USE_INITIAL_FLOW);
+		// A small calibration error leaves the matches a constant offset above or
+		// below the left row (e.g., ~1.7 pixels on the EuRoC Vicon room 2
+		// sequences): estimate it as the median vertical offset of the
+		// consistent matches and check the rows relative to it.
+		std::vector<bool> consistent(status.size(), false);
+		std::vector<float> rowOffsets;
 		for(size_t i=0; i<status.size(); ++i)
 		{
-			if(status[i] && refinedStatus[i] && backStatus[i] &&
-			   std::fabs(refined[i].y - leftPts[i].y) <= stereoBackCheck_ && // rectified images
-			   cv::norm(refined[i] - rightPts[i]) <= 2.0 * stereoBackCheck_ &&
-			   cv::norm(backPts[i] - leftPts[i]) <= stereoBackCheck_)
+			consistent[i] = status[i] && refinedStatus[i] && backStatus[i] &&
+					cv::norm(backPts[i] - leftPts[i]) <= stereoBackCheck_;
+			if(consistent[i])
+			{
+				rowOffsets.push_back(refined[i].y - leftPts[i].y);
+			}
+		}
+		if(rowOffsets.size() >= 20)
+		{
+			std::nth_element(rowOffsets.begin(), rowOffsets.begin()+rowOffsets.size()/2, rowOffsets.end());
+			stereoRowOffset_ = rowOffsets[rowOffsets.size()/2];
+		}
+		for(size_t i=0; i<status.size(); ++i)
+		{
+			if(consistent[i] &&
+			   std::fabs(refined[i].y - leftPts[i].y - stereoRowOffset_) <= stereoBackCheck_ && // rectified images
+			   cv::norm(refined[i] - rightPts[i]) <= 2.0 * stereoBackCheck_ + std::fabs(stereoRowOffset_))
 			{
 				rightPts[i] = refined[i];
 			}
@@ -460,6 +495,7 @@ void VIOFrontend::computeDepth(const cv::Mat & left, const cv::Mat & right, cons
 		}
 	}
 	stats_.stereo = withDepth;
+	stats_.stereoRowOffset = stereoRowOffset_;
 }
 
 }
