@@ -17,10 +17,13 @@ param(
     [switch]$NoGui,
     [int]$Jobs = 0
 )
-$ErrorActionPreference = "Stop"
+# Windows PowerShell 5 turns any stderr line of a native program (pip warnings, a failed
+# import probe) into a terminating error under "Stop": keep "Continue" and check
+# $LASTEXITCODE after each native command; cmdlets use -ErrorAction Stop.
+$ErrorActionPreference = "Continue"
 $VcpkgCommit = "e456309491fd875487bf02b8a0dca76c1b1b00cc"  # gtsam 4.3.0, the version the VIO was validated with
 $Triplet = "x64-windows-release"
-$Source = (Resolve-Path (Join-Path $PSScriptRoot "..\..")).Path
+$Source = (Resolve-Path (Join-Path $PSScriptRoot "..\..") -ErrorAction Stop).Path
 $Vcpkg = Join-Path $Root "vcpkg"
 $Venv = Join-Path $Root "venv"
 $Build = Join-Path $Root "build"
@@ -31,7 +34,7 @@ function Step($msg) { Write-Host "`n=== $msg ===" -ForegroundColor Cyan }
 function Check($what) { if ($LASTEXITCODE -ne 0) { throw "$what failed (exit code $LASTEXITCODE)" } }
 
 if ($Root.Length -gt 12) { Write-Warning "Long -Root paths can break the vcpkg builds (Windows path limit), prefer e.g. C:\slam" }
-New-Item -ItemType Directory -Force -Path $Root | Out-Null
+New-Item -ItemType Directory -Force -Path $Root -ErrorAction Stop | Out-Null
 
 Step "1/6 Check Visual Studio, Git, Python"
 if (-not (Get-Command git -ErrorAction SilentlyContinue)) { throw "Git not found: install it from https://git-scm.com/download/win" }
@@ -41,8 +44,8 @@ $vs = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.
 if (-not $vs) { throw "Visual Studio C++ tools not found: add 'Desktop development with C++' in the Visual Studio Installer" }
 Write-Host "Visual Studio: $vs"
 # x64 compiler, CMake and Ninja of Visual Studio in this shell
-Import-Module (Join-Path $vs "Common7\Tools\Microsoft.VisualStudio.DevShell.dll")
-Enter-VsDevShell -VsInstallPath $vs -SkipAutomaticLocation -DevCmdArguments "-arch=x64 -host_arch=x64" | Out-Null
+Import-Module (Join-Path $vs "Common7\Tools\Microsoft.VisualStudio.DevShell.dll") -ErrorAction Stop
+Enter-VsDevShell -VsInstallPath $vs -SkipAutomaticLocation -DevCmdArguments "-arch=x64 -host_arch=x64" -ErrorAction Stop | Out-Null
 foreach ($t in @("cl", "cmake", "ninja")) {
     if (-not (Get-Command $t -ErrorAction SilentlyContinue)) { throw "$t not found: add 'C++ CMake tools for Windows' in the Visual Studio Installer" }
 }
@@ -76,7 +79,7 @@ if (-not (Test-Path $python)) {
     if ($arg) { & $exe $arg -m venv $Venv } else { & $exe -m venv $Venv }
     Check "venv creation"
 }
-& $python -c "import torch, lightglue, pybind11, numpy, rosbags, cv2" 2>$null
+& $python -c "import torch, lightglue, pybind11, numpy, rosbags, cv2" 2>&1 | Out-Null
 if ($LASTEXITCODE -ne 0) {
     & $python -m pip install --upgrade pip
     & $python -m pip install torch --index-url "https://download.pytorch.org/whl/$Cuda"
@@ -93,7 +96,7 @@ Step "3/6 vcpkg $($VcpkgCommit.Substring(0,7)) ($Vcpkg)"
 if (-not (Test-Path (Join-Path $Vcpkg ".git"))) {
     git clone https://github.com/microsoft/vcpkg.git $Vcpkg; Check "vcpkg clone"
 }
-git -C $Vcpkg cat-file -e "$VcpkgCommit^{commit}" 2>$null
+git -C $Vcpkg cat-file -e "$VcpkgCommit^{commit}" 2>&1 | Out-Null
 if ($LASTEXITCODE -ne 0) { git -C $Vcpkg fetch origin; Check "vcpkg fetch" }
 git -C $Vcpkg checkout -q $VcpkgCommit; Check "vcpkg checkout"
 & (Join-Path $Vcpkg "bootstrap-vcpkg.bat") -disableMetrics; Check "vcpkg bootstrap"
