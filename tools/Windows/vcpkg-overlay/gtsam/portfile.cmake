@@ -1,3 +1,7 @@
+# Static on Windows: the DLL exports std::vector<Key> through "class GTSAM_EXPORT Ordering :
+# public KeyVector", which collides (LNK2005) with the std::vector<size_t> code of rtabmap_core.
+vcpkg_check_linkage(ONLY_STATIC_LIBRARY)
+
 vcpkg_from_github(
     OUT_SOURCE_PATH SOURCE_PATH
     REPO borglab/gtsam

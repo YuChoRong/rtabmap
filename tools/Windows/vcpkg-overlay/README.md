@@ -1,6 +1,7 @@
 vcpkg overlay port of gtsam (from microsoft/vcpkg e456309, MIT license),
 changed only to build gtsam_unstable (-DGTSAM_BUILD_UNSTABLE=ON), needed by OdometryVIO,
-and without precompiled headers (MSVC 14.39 hangs on geometry/Unit3.cpp with them).
+and without precompiled headers (MSVC 14.39 hangs on geometry/Unit3.cpp with them),
+as a static library (the DLL exports std::vector<Key> through Ordering, LNK2005 in rtabmap_core).
 
 qtdeclarative: the port of microsoft/vcpkg e456309 (MIT license) with one comment-only patch,
 so that the source folder is named ...-dc3513ca88 instead of ...-f94468adb5. On this test PC an
