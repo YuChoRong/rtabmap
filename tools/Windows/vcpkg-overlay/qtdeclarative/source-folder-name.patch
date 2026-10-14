@@ -1,0 +1,8 @@
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -1,4 +1,5 @@
+ # Copyright (C) 2022 The Qt Company Ltd.
+ # SPDX-License-Identifier: BSD-3-Clause
++# vcpkg overlay: changes the source folder hash, see tools/Windows/vcpkg-overlay/README.md
+ 
+ # Generated from qtdeclarative.pro.
