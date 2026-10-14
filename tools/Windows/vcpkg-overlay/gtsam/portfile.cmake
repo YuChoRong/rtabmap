@@ -31,6 +31,7 @@ vcpkg_cmake_configure(
         -DGTSAM_USE_SYSTEM_METIS=ON
         -DGTSAM_INSTALL_CPPUNITLITE=OFF
         -DGTSAM_BUILD_TYPE_POSTFIXES=OFF
+        -DGTSAM_BUILD_WITH_PRECOMPILED_HEADERS=OFF  # MSVC 14.39 hangs on geometry/Unit3.cpp with the PCH
         ${FEATURE_OPTIONS}
 )
 
