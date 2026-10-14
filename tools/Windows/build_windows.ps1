@@ -82,7 +82,9 @@ if (-not (Test-Path $python)) {
 & $python -c "import torch, lightglue, pybind11, numpy, rosbags, cv2" 2>&1 | Out-Null
 if ($LASTEXITCODE -ne 0) {
     & $python -m pip install --upgrade pip
-    & $python -m pip install torch --index-url "https://download.pytorch.org/whl/$Cuda"
+    # torchvision from the same index: kornia/LightGlue would otherwise pull it from PyPI
+    # and replace torch with the CPU-only wheel
+    & $python -m pip install torch torchvision --index-url "https://download.pytorch.org/whl/$Cuda"
     Check "PyTorch installation (try another -Cuda: cu118, cu126, cu128 or cpu)"
     # LightGlue (Apache-2.0) also provides ALIKED (BSD-3)
     & $python -m pip install numpy pybind11 rosbags opencv-python-headless "git+https://github.com/cvg/LightGlue.git"
