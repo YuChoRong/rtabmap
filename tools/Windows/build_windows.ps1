@@ -129,10 +129,10 @@ $gui = if ($NoGui) { "OFF" } else { "ON" }
 cmake -S $Source -B $Build -G Ninja `
     -DCMAKE_BUILD_TYPE=Release `
     "-DCMAKE_TOOLCHAIN_FILE=$Vcpkg\scripts\buildsystems\vcpkg.cmake" `
-    -DVCPKG_TARGET_TRIPLET=$Triplet `
+    "-DVCPKG_TARGET_TRIPLET=$Triplet" `
     -DVCPKG_MANIFEST_MODE=OFF `
     "-DCMAKE_INSTALL_PREFIX=$Install" `
-    -DWITH_QT=$gui -DRTABMAP_QT_VERSION=6 `
+    "-DWITH_QT=$gui" -DRTABMAP_QT_VERSION=6 `
     -DWITH_PYTHON=ON "-DPython3_EXECUTABLE=$python" "-Dpybind11_DIR=$pybind11Dir" `
     -DWITH_GTSAM=ON -DWITH_REALSENSE2=ON `
     -DWITH_OPENVINS=OFF -DWITH_ORB_OCTREE=OFF -DWITH_TORCH=OFF `
