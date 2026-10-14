@@ -63,7 +63,7 @@ namespace rtabmap {
  * Everything is optimized by an IncrementalFixedLagSmoother that
  * marginalizes the keyframes older than OdomVIO/WindowSize.
  */
-class VIOBackend
+class RTABMAP_CORE_EXPORT VIOBackend
 {
 public:
 	struct Stats
@@ -180,7 +180,7 @@ private:
  * descriptor. The new tracks of a keyframe are matched to the map points not
  * tracked anymore, which become landmarks of the back-end.
  */
-class VIOLocalMap
+class RTABMAP_CORE_EXPORT VIOLocalMap
 {
 public:
 	VIOLocalMap(const ParametersMap & parameters);
