@@ -106,7 +106,7 @@ git -C $Vcpkg checkout -q $VcpkgCommit; Check "vcpkg checkout"
 Step "4/6 Dependencies with vcpkg (first run: 2-3 hours)"
 # Release-only triplet (half the build time); no default features to keep nonfree/GPL code out.
 $packages = @(
-    "eigen3", "zlib",
+    "eigen3", "zlib", "boost-crc",  # boost-crc: FlannIndex.cpp
     "opencv4[core,calib3d,contrib,fs,highgui,intrinsics,jpeg,png,thread,win32ui]",
     "gtsam[core,boost]",           # overlay port with gtsam_unstable (fixed-lag smoother of the VIO)
     "realsense2[core]"             # live D435i (Apache-2.0)
