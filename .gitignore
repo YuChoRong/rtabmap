@@ -35,3 +35,4 @@ vcpkg_deps_from_source/
 # Not build output: Windows build scripts and the vcpkg gtsam patch
 !tools/Windows/build_windows.*
 !tools/Windows/vcpkg-overlay/gtsam/build-fixes.patch
+tools/Windows/.viewer_env/
