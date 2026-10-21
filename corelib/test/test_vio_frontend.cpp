@@ -453,6 +453,7 @@ struct VioRunOptions
 	cv::Vec3d accBias = cv::Vec3d(0,0,0);
 	int blackoutBegin = -1; // frames [begin, end) are uniform gray
 	int blackoutEnd = -1;
+	double imuDelay = 0.0; // added to the IMU stamps (t_imu = t_camera + imuDelay)
 };
 
 struct VioRunResult
@@ -481,10 +482,13 @@ VioRunResult runVio(Odometry & odom, const VioRunOptions & options)
 		double stamp = 1000.0 + i / kImuRateVio;
 		if(options.input != kNoImu)
 		{
+			// Samples are received in stamp order: with a delay, the sample
+			// stamped now was measured imuDelay earlier
+			const int k = i - (int)std::lround(options.imuDelay * kImuRateVio);
 			cv::Vec3d gyro, acc;
-			imuAt(t, gyro, acc);
+			imuAt(-kStaticTime + k / kImuRateVio, gyro, acc);
 			SensorData imu;
-			imu.setStamp(stamp);
+			imu.setStamp(1000.0 + k / kImuRateVio + options.imuDelay);
 			imu.setIMU(IMU(gyro + options.gyroBias, cv::Mat::eye(3,3,CV_64FC1),
 					acc + options.accBias, cv::Mat::eye(3,3,CV_64FC1), kImuLocal));
 			odom.process(imu);
@@ -605,6 +609,42 @@ TEST(OdometryVIOFusionTest, FusionCorrectsImuBias)
 	EXPECT_EQ(fused.nullPoses, 0);
 	EXPECT_LT(fused.finalError, 0.01 * fused.pathLength);
 	EXPECT_LT(fused.finalError * 10.0, propagated.finalError);
+}
+
+TEST(OdometryVIOFusionTest, EstimatesTimeOffset)
+{
+	if(!backendAvailable()) GTEST_SKIP() << "RTAB-Map built without gtsam_unstable";
+
+	for(double delay : {-0.02, 0.02})
+	{
+		VioRunOptions options;
+		options.imuDelay = delay;
+
+		ParametersMap fixedParameters = vioParameters();
+		fixedParameters[Parameters::kOdomVIOEstimateTimeOffset()] = "false";
+		std::unique_ptr<Odometry> ignored(Odometry::create(fixedParameters));
+		VioRunResult ignoredResult = runVio(*ignored, options);
+
+		fixedParameters[Parameters::kOdomVIOTimeOffset()] = uNumber2Str(delay);
+		std::unique_ptr<Odometry> known(Odometry::create(fixedParameters));
+		VioRunResult knownResult = runVio(*known, options);
+
+		std::unique_ptr<Odometry> estimated(Odometry::create(vioParameters()));
+		VioRunResult estimatedResult = runVio(*estimated, options);
+		double offset = ((OdometryVIO*)estimated.get())->timeOffset();
+
+		std::cout << "IMU delay " << delay << " s, estimated " << offset << " s" << std::endl;
+		printResult("  offset ignored", ignoredResult);
+		printResult("  offset known", knownResult);
+		printResult("  offset estimated", estimatedResult);
+
+		EXPECT_NEAR(offset, delay, 0.003);
+		EXPECT_EQ(knownResult.nullPoses, 0);
+		EXPECT_EQ(estimatedResult.nullPoses, 0);
+		EXPECT_LT(knownResult.finalError, 0.6 * ignoredResult.finalError);
+		EXPECT_LT(knownResult.maxError, 0.005 * knownResult.pathLength);
+		EXPECT_LT(estimatedResult.maxError, 0.02 * estimatedResult.pathLength);
+	}
 }
 
 TEST(OdometryVIOFusionTest, BridgesVisualBlackout)
@@ -780,7 +820,10 @@ TEST(OdometryVIOInitTest, ConstantVelocityIsNotTakenAsStatic)
 	if(!backendAvailable()) GTEST_SKIP() << "RTAB-Map built without gtsam_unstable";
 
 	// The image motion prevents initializing while moving at constant velocity
-	std::unique_ptr<Odometry> odom(Odometry::create(vioParameters()));
+	// (static initialization only: the dynamic one would initialize during the motion)
+	ParametersMap staticOnly = vioParameters();
+	staticOnly[Parameters::kOdomVIOInitDynamicWindow()] = "0";
+	std::unique_ptr<Odometry> odom(Odometry::create(staticOnly));
 	double drift = 0.0;
 	double first = firstPoseTime(*odom, &drift);
 	std::cout << "First pose at t=" << first << " s (stop at 0.5 s), drift " << drift << " m" << std::endl;
@@ -789,12 +832,80 @@ TEST(OdometryVIOInitTest, ConstantVelocityIsNotTakenAsStatic)
 	EXPECT_LT(drift, 0.002);
 
 	// Without the image check, the IMU alone initializes during the motion
-	ParametersMap parameters = vioParameters();
+	ParametersMap parameters = staticOnly;
 	parameters[Parameters::kOdomVIOInitMaxMotion()] = "1000";
 	std::unique_ptr<Odometry> imuOnlyCheck(Odometry::create(parameters));
 	double imuOnlyFirst = firstPoseTime(*imuOnlyCheck, &drift);
 	std::cout << "Without the image check: first pose at t=" << imuOnlyFirst << " s" << std::endl;
 	EXPECT_LT(imuOnlyFirst, 0.0);
+}
+
+// Starting while moving (constant velocity, then stop): the dynamic
+// initialization aligns the stereo visual odometry with the IMU during the
+// motion, and the poses follow the trajectory.
+TEST(OdometryVIOInitTest, MovingStartInitializesDynamically)
+{
+	if(!backendAvailable()) GTEST_SKIP() << "RTAB-Map built without gtsam_unstable";
+
+	std::unique_ptr<Odometry> odom(Odometry::create(vioParameters()));
+	double drift = 0.0;
+	double first = firstPoseTime(*odom, &drift);
+	// the sequence starts at t=-1 s, the default window is 1 s
+	double truth = constantVelocityThenStopD(1.5).translation().x() - constantVelocityThenStopD(first).translation().x();
+	std::cout << "First pose at t=" << first << " s, odometry moved " << odom->getPose().getNorm()
+			<< " m (truth " << truth << " m)" << std::endl;
+	EXPECT_LE(first, 1e-6);
+	EXPECT_NEAR(odom->getPose().getNorm(), truth, 0.01);
+}
+
+// The full visual-inertial sequence started while moving fast (1 m/s with
+// rotations): same accuracy as with the static start.
+TEST(OdometryVIOInitTest, FastMovingStartFollowsGroundTruth)
+{
+	if(!backendAvailable()) GTEST_SKIP() << "RTAB-Map built without gtsam_unstable";
+
+	std::unique_ptr<Odometry> odom(Odometry::create(vioParameters()));
+	const int imuPerImage = (int)std::lround(kImuRateVio / kCameraRateVio);
+	const int startStep = (int)std::lround((kStaticTime + 0.5) * kImuRateVio); // t=0.5 s
+	const int steps = (int)std::lround((kStaticTime + kMotionTime) * kImuRateVio);
+	Transform firstGt, firstPose;
+	double maxError = 0.0, firstTime = -1.0;
+	for(int i=startStep; i<=steps; ++i)
+	{
+		double t = -kStaticTime + i / kImuRateVio;
+		double stamp = 1000.0 + i / kImuRateVio;
+		cv::Vec3d gyro, acc;
+		imuAt(t, gyro, acc);
+		SensorData imu;
+		imu.setStamp(stamp);
+		imu.setIMU(IMU(gyro, cv::Mat::eye(3,3,CV_64FC1), acc, cv::Mat::eye(3,3,CV_64FC1), kImuLocal));
+		odom->process(imu);
+		if(i % imuPerImage != 0)
+		{
+			continue;
+		}
+		const std::pair<cv::Mat, cv::Mat> & images = vioFrame(i / imuPerImage);
+		SensorData data(images.first, images.second, stereoModel(), i/imuPerImage+1, stamp);
+		if(odom->process(data).isNull())
+		{
+			ASSERT_TRUE(firstPose.isNull()) << "lost at t=" << t;
+			continue;
+		}
+		if(firstPose.isNull())
+		{
+			firstPose = odom->getPose();
+			firstGt = groundTruthVio(t);
+			firstTime = t;
+		}
+		// Relative to the first pose (the odometry frame has its own yaw)
+		Transform expected = firstGt.inverse() * groundTruthVio(t);
+		Transform estimated = firstPose.inverse() * odom->getPose();
+		maxError = std::max(maxError, (double)expected.getDistance(estimated));
+	}
+	std::cout << "Moving start: first pose at t=" << firstTime << " s, max error " << maxError << " m" << std::endl;
+	EXPECT_GT(firstTime, 0.5);
+	EXPECT_LT(firstTime, 1.7);
+	EXPECT_LT(maxError, 0.05);
 }
 
 #ifdef RTABMAP_GTSAM_UNSTABLE

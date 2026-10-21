@@ -264,6 +264,9 @@ PreferencesDialog::PreferencesDialog(QWidget * parent) :
 #ifndef RTABMAP_LIOSAM
 	_ui->odom_strategy->setItemData(14, 0, Qt::UserRole - 1);
 #endif
+#ifndef RTABMAP_GTSAM
+	_ui->odom_strategy->setItemData(15, 0, Qt::UserRole - 1);
+#endif
 
 #if CV_MAJOR_VERSION < 3
 	_ui->stereosgbm_mode->setItemData(2, 0, Qt::UserRole - 1);
@@ -5243,6 +5246,12 @@ void PreferencesDialog::setParameter(const std::string & key, const std::string 
 			ULOGGER_WARN("QObject called %s can't be cast to a supported widget", key.c_str());
 		}
 	}
+	else if(Parameters::getDefaultParameters().find(key) != Parameters::getDefaultParameters().end())
+	{
+		// Parameters without a widget (e.g., OdomVIO/*) can still be set from the command line
+		UDEBUG("Parameter %s has no widget, using value \"%s\"", key.c_str(), value.c_str());
+		uInsert(_parameters, ParametersPair(key, value));
+	}
 	else
 	{
 		ULOGGER_WARN("Can't find the related QObject for parameter %s", key.c_str());
@@ -5781,6 +5790,10 @@ void PreferencesDialog::updateOdometryStackedIndex(int index)
 	if(index == 11) // FLOAM -> LOAM
 	{
 		_ui->stackedWidget_odometryType->setCurrentIndex(7);
+	}
+	else if(index == 15) // VIO: no page, OdomVIO/* parameters can be set on the command line
+	{
+		_ui->stackedWidget_odometryType->setCurrentIndex(0);
 	}
 	else
 	{

@@ -16555,6 +16555,11 @@ With &lt;0, the length is estimated once for each unique marker, then re-used fo
                           <string>LIO-SAM</string>
                          </property>
                         </item>
+                        <item>
+                         <property name="text">
+                          <string>VIO (stereo + IMU, GTSAM)</string>
+                         </property>
+                        </item>
                        </widget>
                       </item>
                       <item row="3" column="1">

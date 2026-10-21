@@ -64,6 +64,9 @@ public:
 	virtual Odometry::Type getType() {return Odometry::kTypeVIO;}
 	virtual bool canProcessAsyncIMU() const {return true;}
 
+	// Current camera-IMU time offset (s), t_imu = t_camera + offset (see OdomVIO/TimeOffset)
+	double timeOffset() const;
+
 private:
 	virtual Transform computeTransform(SensorData & data, const Transform & guess = Transform(), OdometryInfo * info = 0);
 

@@ -1,3 +1,7 @@
+# Static on Windows: the DLL exports std::vector<Key> through "class GTSAM_EXPORT Ordering :
+# public KeyVector", which collides (LNK2005) with the std::vector<size_t> code of rtabmap_core.
+vcpkg_check_linkage(ONLY_STATIC_LIBRARY)
+
 vcpkg_from_github(
     OUT_SOURCE_PATH SOURCE_PATH
     REPO borglab/gtsam
@@ -31,6 +35,7 @@ vcpkg_cmake_configure(
         -DGTSAM_USE_SYSTEM_METIS=ON
         -DGTSAM_INSTALL_CPPUNITLITE=OFF
         -DGTSAM_BUILD_TYPE_POSTFIXES=OFF
+        -DGTSAM_BUILD_WITH_PRECOMPILED_HEADERS=OFF  # MSVC 14.39 hangs on geometry/Unit3.cpp with the PCH
         ${FEATURE_OPTIONS}
 )
 
