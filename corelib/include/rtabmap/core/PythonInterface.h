@@ -39,6 +39,9 @@ private:
 	explicit PythonInterface(const std::string & caller);
 	~PythonInterface();
 
+	static void finalizeAtExit();
+	void finalize();
+
 	pybind11::scoped_interpreter* guard_;
 	pybind11::gil_scoped_release* release_;
 };

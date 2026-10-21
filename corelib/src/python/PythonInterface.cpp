@@ -12,6 +12,9 @@
 #include <pybind11/embed.h>
 #include <filesystem>
 #include <thread>
+#ifdef _WIN32
+#include <corecrt_startup.h> // _crt_atexit
+#endif
 
 namespace rtabmap {
 
@@ -52,13 +55,38 @@ PythonInterface::PythonInterface(const std::string & caller)
 
 	pybind11::module::import("threading");
 	release_ = new pybind11::gil_scoped_release();
+
+#ifdef _WIN32
+	// This singleton lives in rtabmap_core.dll, so its destructor runs from
+	// DLL_PROCESS_DETACH, after ExitProcess() has terminated all other threads
+	// (torch/CUDA workers...). Finalizing Python there never returns: Windows
+	// ends the process on the spot (exit code 0), before the C runtime flushes
+	// stdout. Finalize from the executable's exit() instead (same table as
+	// atexit() in the executable), while the other threads are still alive.
+	_crt_atexit(&PythonInterface::finalizeAtExit);
+#endif
 }
 
 PythonInterface::~PythonInterface()
 {
-	UINFO("Finalize python interpreter");
-	delete release_;
-	delete guard_;
+	finalize();
+}
+
+void PythonInterface::finalizeAtExit()
+{
+	instance().finalize();
+}
+
+void PythonInterface::finalize()
+{
+	if(guard_)
+	{
+		UINFO("Finalize python interpreter");
+		delete release_;
+		release_ = 0;
+		delete guard_;
+		guard_ = 0;
+	}
 }
 
 std::string getPythonTraceback()
