@@ -34,6 +34,26 @@ in Preferences (Advanced mode), set the source:
 Hold the camera still for 1-2 s at the start, or move it smoothly (dynamic
 initialization). Odometry and loop closure times are in the Statistics panel.
 
+## Live viewer (mapping, localization, map viewing)
+
+```
+C:\slam\src\tools\Windows\live_viewer.bat [--open MAP.db]
+```
+`rtabmap-live_viewer.exe` (tools/LiveViewer, built with RTAB-Map; Qt window with RTAB-Map's 3D
+view), run with the environment of `rtabmap_env.bat`:
+- **1. 실시간 매핑**: D435i (IR stereo, emitter off, + IMU; nothing to set in Preferences) or a
+  recording replayed in real time (`.bag`/`.db3`, converted once next to it, or a EuRoC
+  folder) -> VIO + SLAM. Point cloud map, keyframe graph, loop closures, camera pose and
+  image are shown as they are built; the map is saved as `map_<date>.db` in the chosen folder
+  when stopped (or when the recording ends).
+- **2. 실시간 로컬라이제이션**: shows a saved map, then localizes the live camera in it (the map
+  file is not modified): current pose, live path, map matches in green. The features (ORB or
+  ALIKED + LightGlue) follow the map.
+- **파일 > 맵 불러오기**: any RTAB-Map `.db`, offline, with the stereo point clouds.
+
+`--auto map|loc|view --source realsense|REC --db OUT_DIR_OR_MAP [--screenshot out.png]` runs one
+module unattended (tests).
+
 ## Recordings
 
 Record with Intel RealSense Viewer (see `tools/RealSense/README.md`), then in cmd:
