@@ -35,7 +35,11 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 // RtabmapThread) in this process; the 3D view is RTAB-Map's CloudViewer.
 // Korean UI strings: this file is UTF-8 (built with /utf-8 on MSVC).
 
+#include <rtabmap/core/Version.h>
 #include <rtabmap/core/Rtabmap.h>
+#ifdef RTABMAP_PYTHON
+#include <rtabmap/core/PythonInterface.h>
+#endif
 #include <rtabmap/core/RtabmapThread.h>
 #include <rtabmap/core/RtabmapEvent.h>
 #include <rtabmap/core/Odometry.h>
@@ -99,6 +103,12 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include <QScreen>
 #include <QPainter>
 #include <QLocale>
+
+#include <vtkVersionMacros.h>
+#if VTK_MAJOR_VERSION > 9 || (VTK_MAJOR_VERSION==9 && VTK_MINOR_VERSION >= 1)
+#include <QVTKRenderWidget.h>
+#endif
+#include <QSurfaceFormat>
 
 #include <atomic>
 #include <condition_variable>
@@ -873,12 +883,12 @@ protected:
 		if(!image.empty() && imageTimer_.elapsed() > 100)
 		{
 			imageTimer_.restart();
-			cv::Mat small = image;
-			if(small.cols > 640)
+			cv::Mat thumb = image;
+			if(thumb.cols > 640)
 			{
-				cv::resize(image, small, cv::Size(), 0.5, 0.5, cv::INTER_AREA);
+				cv::resize(image, thumb, cv::Size(), 0.5, 0.5, cv::INTER_AREA);
 			}
-			img = uCvMat2QImage(small, true).copy();
+			img = uCvMat2QImage(thumb, true).copy();
 		}
 		std::lock_guard<std::mutex> lock(odomMutex_);
 		odom_.mapPose = mapPose;
@@ -1435,7 +1445,9 @@ private:
 		if(worker_.joinable()) worker_.join();
 		worker_ = std::thread([this, s]{
 			std::string error;
-			bool ok = engine_.start(s, error);
+			bool ok = false;
+			try {ok = engine_.start(s, error);}
+			catch(const std::exception & e) {error = e.what();}
 			gui([this, ok, error]{
 				busy_ = false;
 				if(!ok)
@@ -1475,7 +1487,9 @@ private:
 		std::string db = engine_.settings().db;
 		if(worker_.joinable()) worker_.join();
 		worker_ = std::thread([this, mapping, db]{
-			int nodes = engine_.stop();
+			int nodes = 0;
+			try {nodes = engine_.stop();}
+			catch(const std::exception & e) {std::string what = e.what(); gui([this, what]{log(tr8("정지 중 오류: %1").arg(QString::fromStdString(what)), 2);});}
 			gui([this, mapping, db, nodes]{
 				busy_ = false;
 				setRunning(false);
@@ -1526,7 +1540,9 @@ private:
 		if(worker_.joinable()) worker_.join();
 		worker_ = std::thread([this, s]{
 			std::string error;
-			bool ok = engine_.view(s, error);
+			bool ok = false;
+			try {ok = engine_.view(s, error);}
+			catch(const std::exception & e) {error = e.what();}
 			gui([this, ok, error]{
 				busy_ = false;
 				setRunning(false);
@@ -1943,6 +1959,20 @@ int main(int argc, char * argv[])
 			return 0;
 		}
 	}
+#ifdef _WIN32
+	CoInitialize(nullptr);
+#endif
+#ifdef RTABMAP_PYTHON
+	// the embedded Python (ALIKED / LightGlue plugins) must start on the main thread,
+	// the map is created by a worker thread
+	PythonInterface::instance("rtabmap-live_viewer");
+#endif
+	setvbuf(stdout, NULL, _IONBF, 0);
+#if VTK_MAJOR_VERSION > 9 || (VTK_MAJOR_VERSION==9 && VTK_MINOR_VERSION >= 1)
+	// OpenGL context VTK needs for its QOpenGLWidget (as in rtabmap and rtabmap-databaseViewer)
+	QSurfaceFormat::setDefaultFormat(QVTKRenderWidget::defaultFormat());
+#endif
+	QApplication::setAttribute(Qt::AA_ShareOpenGLContexts);
 	QApplication app(argc, argv);
 	LiveWindow * window = new LiveWindow(app.arguments());
 	window->show();

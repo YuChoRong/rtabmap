@@ -35,6 +35,7 @@ def init(cuda):
                     detection_threshold=float(os.environ.get('RTABMAP_ALIKED_THRESHOLD', '0.2'))).eval().to(device)
     print('ALIKED initialized on %s' % device)
 
+@torch.no_grad()  # grad mode is per thread: set_grad_enabled at import does not cover the caller thread
 def detect(imageBuffer):
     image = np.asarray(imageBuffer)  # HxW uint8
     tensor = torch.from_numpy(image.astype(np.float32) / 255.)[None, None].to(device)

@@ -38,6 +38,7 @@ def init(descriptorDim, matchThreshold, iterations, cuda, model):
     global superglue
     superglue = SuperGlue(config.get('superglue', {})).eval().to(device)
 
+@torch.no_grad()  # grad mode is per thread: set_grad_enabled at import does not cover the caller thread
 def match(kptsFrom, kptsTo, scoresFrom, scoresTo, descriptorsFrom, descriptorsTo, imageWidth, imageHeight):
     #print("SuperGlue python match()")
     global device
