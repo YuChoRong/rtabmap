@@ -137,7 +137,7 @@ struct CloudParams
 	CameraModel color;   // color camera of the keyframes' user data (D435i RGB), if any
 };
 
-// Color image attached as user data (JPEG, see CameraRealSense2::setColorWithIR()).
+// Color image attached as user data (JPEG bytes in a CV_8SC1 row, see CameraRealSense2::setColorWithIR()).
 static cv::Mat colorImage(const SensorData & data)
 {
 	cv::Mat ud = data.userDataRaw();
@@ -145,9 +145,9 @@ static cv::Mat colorImage(const SensorData & data)
 	{
 		data.uncompressDataConst(0, 0, 0, &ud);
 	}
-	if(ud.type() == CV_8UC1 && ud.rows == 1 && ud.cols > 4 && ud.data[0] == 0xFF && ud.data[1] == 0xD8)
+	if(ud.depth() == CV_8S && ud.channels() == 1 && ud.rows == 1 && ud.cols > 4 && ud.data[0] == 0xFF && ud.data[1] == 0xD8)
 	{
-		return cv::imdecode(ud, cv::IMREAD_COLOR);
+		return cv::imdecode(cv::Mat(1, ud.cols, CV_8UC1, ud.data), cv::IMREAD_COLOR);
 	}
 	return cv::Mat();
 }
@@ -519,7 +519,7 @@ private:
 				std::vector<unsigned char> jpg;
 				if(!color.empty() && cv::imencode(".jpg", color, jpg, std::vector<int>{cv::IMWRITE_JPEG_QUALITY, 90}))
 				{
-					data.setUserData(cv::Mat(1, (int)jpg.size(), CV_8UC1, jpg.data()).clone());
+					data.setUserData(cv::Mat(1, (int)jpg.size(), CV_8SC1, jpg.data()).clone()); // CV_8SC1: a CV_8UC1 row would be taken as already zlib-compressed
 				}
 			}
 		}
@@ -1035,13 +1035,19 @@ protected:
 		// only the latest frame is drawn (by the render timer), so that a slow display
 		// never queues up behind the camera
 		QImage img;
+		if(!color.empty())
+		{
+			lastColor_ = color;
+			lastColorStamp_ = stamp;
+		}
 		if(!image.empty() && imageTimer_.elapsed() > 100)
 		{
 			imageTimer_.restart();
-			cv::Mat thumb = color.empty()?image:color;
+			// show the color camera when it is there (decoded ~10 Hz), else the IR image
+			cv::Mat thumb = !lastColor_.empty() && fabs(stamp - lastColorStamp_) < 0.5?lastColor_:image;
 			if(thumb.cols > 640)
 			{
-				cv::resize(image, thumb, cv::Size(), 0.5, 0.5, cv::INTER_AREA);
+				cv::resize(thumb, thumb, cv::Size(), 0.5, 0.5, cv::INTER_AREA);
 			}
 			img = uCvMat2QImage(thumb, true).copy();
 		}
@@ -1210,7 +1216,7 @@ private:
 		QGroupBox * dispBox = new QGroupBox(tr8("표시"));
 		QFormLayout * dl = new QFormLayout(dispBox);
 		colorMode_ = new QComboBox;
-		colorMode_->addItem(tr8("IR 밝기"));
+		colorMode_->addItem(tr8("실제 색 (RGB, 없으면 IR 밝기)"));
 		colorMode_->addItem(tr8("키프레임별 색"));
 		connect(colorMode_, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this](int){applyCloudStyle();});
 		pointSize_ = new QSpinBox;
@@ -2111,6 +2117,8 @@ private:
 	QPushButton * btnLoc_;
 	QPushButton * btnStop_;
 	QComboBox * colorMode_;
+	cv::Mat lastColor_; // engine thread only
+	double lastColorStamp_ = 0.0;
 	QSpinBox * pointSize_;
 	QCheckBox * follow_;
 	QCheckBox * showClouds_;

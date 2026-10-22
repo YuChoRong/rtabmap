@@ -1540,7 +1540,7 @@ SensorData CameraRealSense2::captureImage(SensorCaptureInfo * info)
 						{
 							std::vector<unsigned char> jpg;
 							cv::imencode(".jpg", color, jpg, std::vector<int>{cv::IMWRITE_JPEG_QUALITY, 90});
-							data.setUserData(cv::Mat(1, (int)jpg.size(), CV_8UC1, jpg.data()).clone());
+							data.setUserData(cv::Mat(1, (int)jpg.size(), CV_8SC1, jpg.data()).clone()); // CV_8SC1: a CV_8UC1 row would be taken as already zlib-compressed
 						}
 					}
 				}

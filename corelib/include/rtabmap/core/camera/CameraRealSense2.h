@@ -80,7 +80,7 @@ public:
 	/**
 	 * With setIRFormat(true, false) (left/right IR as stereo): also stream the color camera.
 	 * The color frame closest in time to each stereo frame is attached as user data,
-	 * JPEG encoded (1 x N CV_8UC1). Its calibration is colorModel() after init().
+	 * JPEG encoded (1 x N CV_8SC1, as a CV_8UC1 row would be taken as already compressed). Its calibration is colorModel() after init().
 	 */
 	void setColorWithIR(bool enabled, int width = 640, int height = 480);
 	/** Calibration of the color camera of setColorWithIR(), local transform from the base frame. */
