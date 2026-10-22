@@ -34,6 +34,7 @@ def init(descriptorDim, matchThreshold, iterations, cuda, model):
     matcher = LightGlue(features=features, filter_threshold=matchThreshold).eval().to(device)
     print('LightGlue (%s) initialized on %s' % (features, device))
 
+@torch.no_grad()  # grad mode is per thread: set_grad_enabled at import does not cover the caller thread
 def match(kptsFrom, kptsTo, scoresFrom, scoresTo, descriptorsFrom, descriptorsTo, imageWidth, imageHeight):
     size = torch.tensor([[imageWidth, imageHeight]], dtype=torch.float32, device=device)
     def view(kpts, desc):

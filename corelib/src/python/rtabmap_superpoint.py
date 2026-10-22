@@ -40,6 +40,7 @@ def init(cuda):
                           nn_thresh=1,
                           cuda=cuda)
 
+@torch.no_grad()  # grad mode is per thread: set_grad_enabled at import does not cover the caller thread
 def detect(imageBuffer):
     #print("SuperPoint python detect()")
     global device
