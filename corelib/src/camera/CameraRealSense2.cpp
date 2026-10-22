@@ -26,6 +26,7 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 #include <rtabmap/core/camera/CameraRealSense2.h>
 #include <rtabmap/core/util2d.h>
+#include <opencv2/imgcodecs.hpp>
 #include <rtabmap/utilite/UTimer.h>
 #include <rtabmap/utilite/UThreadC.h>
 #include <rtabmap/utilite/UConversion.h>
@@ -64,6 +65,10 @@ CameraRealSense2::CameraRealSense2(
 	clockSyncWarningShown_(false),
 	imuGlobalSyncWarningShown_(false),
 	emitterEnabled_(true),
+	colorWithIR_(false),
+	colorWidth_(640),
+	colorHeight_(480),
+	lastColorStamp_(0.0),
 	ir_(false),
 	irDepth_(true),
 	rectifyImages_(true),
@@ -225,6 +230,21 @@ void CameraRealSense2::multiple_message_callback(rs2::frame frame)
         		pose_callback(frame);
         	}
             break;
+        case RS2_STREAM_COLOR:
+        	if(colorWithIR_ && ir_ && !irDepth_)
+        	{
+        		// kept apart from the IR stereo frames (syncer), attached in captureImage()
+        		rs2::video_frame vf = frame.as<rs2::video_frame>();
+        		cv::Mat rgb(cv::Size(vf.get_width(), vf.get_height()), CV_8UC3, (void*)vf.get_data());
+        		cv::Mat bgr;
+        		cv::cvtColor(rgb, bgr, cv::COLOR_RGB2BGR);
+        		UScopeMutex lock(colorMutex_);
+        		lastColor_ = bgr;
+        		lastColorStamp_ = frame.get_timestamp()/1000.0;
+        		break;
+        	}
+        	frame_callback(frame);
+        	break;
         default:
         	//UWARN("IMG : Domain=%d time=%f host=%f", frame.get_frame_timestamp_domain(), frame.get_timestamp()/1000.0, UTimer::now());
             frame_callback(frame);
@@ -682,7 +702,7 @@ bool CameraRealSense2::init(const std::string & calibrationFolder, const std::st
 		}
 		else if ("RGB Camera" == module_name)
 		{
-			if(!ir_)
+			if(!ir_ || (colorWithIR_ && !irDepth_))
 			{
 				sensors[0] = elem;
 			}
@@ -741,6 +761,31 @@ bool CameraRealSense2::init(const std::string & calibrationFolder, const std::st
 	 {
 		if(i==0 && ir_ && !stereo)
 		{
+			if(colorWithIR_ && !irDepth_ && sensors[0])
+			{
+				// color stream next to the IR stereo pair
+				for (auto& profile : sensors[0].get_stream_profiles())
+				{
+					auto video_profile = profile.as<rs2::video_stream_profile>();
+					if(video_profile.get() &&
+					   video_profile.format() == RS2_FORMAT_RGB8 &&
+					   video_profile.stream_type() == RS2_STREAM_COLOR &&
+					   video_profile.width() == colorWidth_ &&
+					   video_profile.height() == colorHeight_ &&
+					   video_profile.fps() == cameraFps_)
+					{
+						auto intrinsic = video_profile.get_intrinsics();
+						profilesPerSensor[0].push_back(profile);
+						colorModel_ = CameraModel(std::string(camera_name)+"_color", intrinsic.fx, intrinsic.fy, intrinsic.ppx, intrinsic.ppy, this->getLocalTransform(), 0, cv::Size(intrinsic.width, intrinsic.height));
+						UINFO("Color model: %dx%d fx=%f fy=%f cx=%f cy=%f", intrinsic.width, intrinsic.height, intrinsic.fx, intrinsic.fy, intrinsic.ppx, intrinsic.ppy);
+						break;
+					}
+				}
+				if(profilesPerSensor[0].empty())
+				{
+					UWARN("Color stream %dx%d at %d Hz not available, continuing without color.", colorWidth_, colorHeight_, cameraFps_);
+				}
+			}
 			continue;
 		}
 		UINFO("Sensor %d \"%s\"", (int)i, sensors[i].get_info(RS2_CAMERA_INFO_NAME));
@@ -992,6 +1037,18 @@ bool CameraRealSense2::init(const std::string & calibrationFolder, const std::st
 
 			 // Create stereo camera model from left and right ir of D435
 			 stereoModel_ = StereoCameraModel(model_.fx(), model_.fy(), model_.cx(), model_.cy(), leftToRightT.x(), model_.localTransform(), model_.imageSize());
+
+			 if(!profilesPerSensor[0].empty() && colorModel_.isValidForProjection())
+			 {
+				 // pose of the color camera in the left IR camera frame (rs2 rotations are column-major)
+				 rs2_extrinsics colorToLeft = profilesPerSensor[0][0].get_extrinsics_to(profilesPerSensor[1][0]);
+				 Transform leftToColorT(
+						 colorToLeft.rotation[0], colorToLeft.rotation[3], colorToLeft.rotation[6], colorToLeft.translation[0],
+						 colorToLeft.rotation[1], colorToLeft.rotation[4], colorToLeft.rotation[7], colorToLeft.translation[1],
+						 colorToLeft.rotation[2], colorToLeft.rotation[5], colorToLeft.rotation[8], colorToLeft.translation[2]);
+				 colorModel_.setLocalTransform(model_.localTransform() * leftToColorT);
+				 UINFO("color local transform = %s", colorModel_.localTransform().prettyPrint().c_str());
+			 }
 			 UINFO("Stereo parameters: fx=%f cx=%f cy=%f baseline=%f",
 						stereoModel_.left().fx(),
 						stereoModel_.left().cx(),
@@ -1001,7 +1058,7 @@ bool CameraRealSense2::init(const std::string & calibrationFolder, const std::st
 
 		 if(!dualMode_ && profilesPerSensor.size() == 3)
 		 {
-			 if(!profilesPerSensor[2].empty() && !profilesPerSensor[0].empty())
+			 if(!profilesPerSensor[2].empty() && !profilesPerSensor[0].empty() && !ir_)
 			 {
 				 rs2_extrinsics leftToIMU = profilesPerSensor[2][0].get_extrinsics_to(profilesPerSensor[0][0]);
 				 Transform leftToIMUT(
@@ -1220,6 +1277,25 @@ bool CameraRealSense2::getPose(double stamp, Transform & pose, cv::Mat & covaria
 	}
 #endif
 	return false;
+}
+
+void CameraRealSense2::setColorWithIR(bool enabled, int width, int height)
+{
+#ifdef RTABMAP_REALSENSE2
+	colorWithIR_ = enabled;
+	colorWidth_ = width;
+	colorHeight_ = height;
+#endif
+}
+
+const CameraModel & CameraRealSense2::colorModel() const
+{
+#ifdef RTABMAP_REALSENSE2
+	return colorModel_;
+#else
+	static CameraModel empty;
+	return empty;
+#endif
 }
 
 void CameraRealSense2::setEmitterEnabled(bool enabled)
@@ -1450,6 +1526,23 @@ SensorData CameraRealSense2::captureImage(SensorCaptureInfo * info)
 				{
 					//stereo D435
 					data = SensorData(bgr, depth, stereoModel_, this->getNextSeqID(), stamp);
+					if(colorWithIR_)
+					{
+						cv::Mat color;
+						{
+							UScopeMutex lock(colorMutex_);
+							if(!lastColor_.empty() && fabs(lastColorStamp_ - stamp) < 0.05)
+							{
+								color = lastColor_;
+							}
+						}
+						if(!color.empty())
+						{
+							std::vector<unsigned char> jpg;
+							cv::imencode(".jpg", color, jpg, std::vector<int>{cv::IMWRITE_JPEG_QUALITY, 90});
+							data.setUserData(cv::Mat(1, (int)jpg.size(), CV_8UC1, jpg.data()).clone());
+						}
+					}
 				}
 				else
 				{

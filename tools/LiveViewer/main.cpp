@@ -68,6 +68,7 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include <rtabmap/utilite/UConversion.h>
 #include <rtabmap/utilite/UStl.h>
 #include <opencv2/imgproc.hpp>
+#include <opencv2/imgcodecs.hpp>
 #include <yaml-cpp/yaml.h>
 
 #include <QApplication>
@@ -133,7 +134,50 @@ struct CloudParams
 	float minDepth = 0.2f;
 	float voxel = 0.03f;
 	ParametersMap stereo;
+	CameraModel color;   // color camera of the keyframes' user data (D435i RGB), if any
 };
+
+// Color image attached as user data (JPEG, see CameraRealSense2::setColorWithIR()).
+static cv::Mat colorImage(const SensorData & data)
+{
+	cv::Mat ud = data.userDataRaw();
+	if(ud.empty() && !data.userDataCompressed().empty())
+	{
+		data.uncompressDataConst(0, 0, 0, &ud);
+	}
+	if(ud.type() == CV_8UC1 && ud.rows == 1 && ud.cols > 4 && ud.data[0] == 0xFF && ud.data[1] == 0xD8)
+	{
+		return cv::imdecode(ud, cv::IMREAD_COLOR);
+	}
+	return cv::Mat();
+}
+
+// Colors the points (base frame) seen by the color camera.
+static void colorize(pcl::PointCloud<pcl::PointXYZRGB> & cloud, const cv::Mat & bgr, const CameraModel & model)
+{
+	if(bgr.empty() || !model.isValidForProjection() || model.localTransform().isNull())
+	{
+		return;
+	}
+	Eigen::Affine3f toCam = model.localTransform().inverse().toEigen3f();
+	float sx = model.imageWidth()>0?float(bgr.cols)/float(model.imageWidth()):1.0f;
+	float sy = model.imageHeight()>0?float(bgr.rows)/float(model.imageHeight()):1.0f;
+	float fx = model.fx()*sx, fy = model.fy()*sy, cx = model.cx()*sx, cy = model.cy()*sy;
+	for(pcl::PointXYZRGB & p : cloud.points)
+	{
+		Eigen::Vector3f c = toCam * Eigen::Vector3f(p.x, p.y, p.z);
+		if(c[2] > 0.05f)
+		{
+			int u = int(fx*c[0]/c[2] + cx + 0.5f);
+			int v = int(fy*c[1]/c[2] + cy + 0.5f);
+			if(u >= 0 && v >= 0 && u < bgr.cols && v < bgr.rows)
+			{
+				const cv::Vec3b & q = bgr.at<cv::Vec3b>(v, u);
+				p.b = q[0]; p.g = q[1]; p.r = q[2];
+			}
+		}
+	}
+}
 
 // Point cloud of a keyframe in its base frame: from stereo (or depth) when the images are
 // there, else from its 3D visual words.
@@ -141,7 +185,8 @@ static pcl::PointCloud<pcl::PointXYZRGB>::Ptr keyframeCloud(const Signature & s,
 {
 	pcl::PointCloud<pcl::PointXYZRGB>::Ptr cloud(new pcl::PointCloud<pcl::PointXYZRGB>);
 	SensorData data = s.sensorData();
-	if(data.imageRaw().empty() && !data.imageCompressed().empty())
+	if((data.imageRaw().empty() && !data.imageCompressed().empty()) ||
+	   (data.userDataRaw().empty() && !data.userDataCompressed().empty()))
 	{
 		data.uncompressData();
 	}
@@ -149,6 +194,7 @@ static pcl::PointCloud<pcl::PointXYZRGB>::Ptr keyframeCloud(const Signature & s,
 	{
 		cloud = util3d::cloudRGBFromSensorData(data, p.decimation, p.maxDepth, p.minDepth, 0, p.stereo);
 		cloud = util3d::removeNaNFromPointCloud(cloud); // organized cloud with NaNs
+		colorize(*cloud, colorImage(data), p.color);
 		if(cloud->size() && p.voxel > 0.0f)
 		{
 			cloud = util3d::voxelize(cloud, p.voxel);
@@ -180,7 +226,7 @@ class EngineListener
 public:
 	virtual ~EngineListener() {}
 	virtual void engineStatus(const QString & text, int level) = 0; // 0 info, 1 warning, 2 error
-	virtual void engineOdometry(const Transform & odomPose, const Transform & mapPose, const OdometryInfo & info, const cv::Mat & image, double stamp) = 0;
+	virtual void engineOdometry(const Transform & odomPose, const Transform & mapPose, const OdometryInfo & info, const cv::Mat & image, const cv::Mat & color, double stamp) = 0;
 	virtual void engineGraph(const std::map<int, Transform> & poses, const std::multimap<int, Link> & links,
 			bool fullMap, int loopId, int proxId, float slamMs, const Transform & localizedPose) = 0;
 	virtual void engineCloud(int id, const pcl::PointCloud<pcl::PointXYZRGB>::Ptr & cloud) = 0;
@@ -285,44 +331,53 @@ public:
 		delete capture_;
 	}
 
+	// EuRoC sensor.yaml: intrinsics, distortion and T_BS (camera in the body frame) as local transform
+	static bool loadCamera(const std::string & calibPath, const std::string & name, CameraModel & model, std::string & error)
+	{
+		if(!UFile::exists(calibPath))
+		{
+			error = "missing " + calibPath;
+			return false;
+		}
+		YAML::Node config = YAML::LoadFile(calibPath);
+		YAML::Node data = config["T_BS"]["data"];
+		YAML::Node resolution = config["resolution"];
+		YAML::Node intrinsics = config["intrinsics"];
+		YAML::Node dist = config["distortion_coefficients"];
+		if(data.size() != 16 || resolution.size() != 2 || intrinsics.size() != 4)
+		{
+			error = "invalid calibration " + calibPath;
+			return false;
+		}
+		cv::Mat K = cv::Mat::eye(3, 3, CV_64FC1);
+		K.at<double>(0,0) = intrinsics[0].as<double>();
+		K.at<double>(1,1) = intrinsics[1].as<double>();
+		K.at<double>(0,2) = intrinsics[2].as<double>();
+		K.at<double>(1,2) = intrinsics[3].as<double>();
+		cv::Mat R = cv::Mat::eye(3, 3, CV_64FC1);
+		cv::Mat P = cv::Mat::zeros(3, 4, CV_64FC1);
+		K.copyTo(cv::Mat(P, cv::Range(0,3), cv::Range(0,3)));
+		cv::Mat D = cv::Mat::zeros(1, dist.size()?dist.size():4, CV_64FC1);
+		for(unsigned int i=0; i<dist.size(); ++i)
+		{
+			D.at<double>(i) = dist[i].as<double>();
+		}
+		Transform t(data[0].as<float>(), data[1].as<float>(), data[2].as<float>(), data[3].as<float>(),
+					data[4].as<float>(), data[5].as<float>(), data[6].as<float>(), data[7].as<float>(),
+					data[8].as<float>(), data[9].as<float>(), data[10].as<float>(), data[11].as<float>());
+		model = CameraModel(name, cv::Size(resolution[0].as<int>(),resolution[1].as<int>()), K, D, R, P, t);
+		return true;
+	}
+
 	bool init(const std::string & calibDir, std::string & error)
 	{
-		std::vector<CameraModel> models;
+		std::vector<CameraModel> models(2);
 		for(int k=0; k<2; ++k)
 		{
-			std::string calibPath = path_ + (k==0?"/mav0/cam0/sensor.yaml":"/mav0/cam1/sensor.yaml");
-			if(!UFile::exists(calibPath))
+			if(!loadCamera(path_ + (k==0?"/mav0/cam0/sensor.yaml":"/mav0/cam1/sensor.yaml"), "live_replay_calib", models[k], error))
 			{
-				error = "missing " + calibPath;
 				return false;
 			}
-			YAML::Node config = YAML::LoadFile(calibPath);
-			YAML::Node data = config["T_BS"]["data"];
-			YAML::Node resolution = config["resolution"];
-			YAML::Node intrinsics = config["intrinsics"];
-			YAML::Node dist = config["distortion_coefficients"];
-			if(data.size() != 16 || resolution.size() != 2 || intrinsics.size() != 4)
-			{
-				error = "invalid calibration " + calibPath;
-				return false;
-			}
-			cv::Mat K = cv::Mat::eye(3, 3, CV_64FC1);
-			K.at<double>(0,0) = intrinsics[0].as<double>();
-			K.at<double>(1,1) = intrinsics[1].as<double>();
-			K.at<double>(0,2) = intrinsics[2].as<double>();
-			K.at<double>(1,2) = intrinsics[3].as<double>();
-			cv::Mat R = cv::Mat::eye(3, 3, CV_64FC1);
-			cv::Mat P = cv::Mat::zeros(3, 4, CV_64FC1);
-			K.copyTo(cv::Mat(P, cv::Range(0,3), cv::Range(0,3)));
-			cv::Mat D = cv::Mat::zeros(1, dist.size()?dist.size():4, CV_64FC1);
-			for(unsigned int i=0; i<dist.size(); ++i)
-			{
-				D.at<double>(i) = dist[i].as<double>();
-			}
-			Transform t(data[0].as<float>(), data[1].as<float>(), data[2].as<float>(), data[3].as<float>(),
-						data[4].as<float>(), data[5].as<float>(), data[6].as<float>(), data[7].as<float>(),
-						data[8].as<float>(), data[9].as<float>(), data[10].as<float>(), data[11].as<float>());
-			models.push_back(CameraModel("live_replay_calib", cv::Size(resolution[0].as<int>(),resolution[1].as<int>()), K, D, R, P, t));
 		}
 		StereoCameraModel model("live_replay_calib", models[0], models[1], models[1].localTransform().inverse() * models[0].localTransform());
 		if(!model.save(calibDir, false))
@@ -355,9 +410,33 @@ public:
 		}
 		std::string header;
 		std::getline(imu_, header);
+
+		// color stream (realsense_bag_to_euroc.py --rgb)
+		std::string rgbCsv = path_+"/mav0/rgb/data.csv";
+		std::string err;
+		if(UFile::exists(rgbCsv) && loadCamera(path_+"/mav0/rgb/sensor.yaml", "live_replay_color", colorModel_, err))
+		{
+			colorModel_.setLocalTransform(baseToImu_*colorModel_.localTransform());
+			std::ifstream f(rgbCsv.c_str());
+			std::string line;
+			while(std::getline(f, line))
+			{
+				std::string ns = uSplit(line, ',').front();
+				if(ns.size() > 9 && ns[0] != '#')
+				{
+					double stamp = double(uStr2Int(ns.substr(0, ns.size()-9))) + double(uStr2Int(ns.substr(ns.size()-9, 9)))*1e-9;
+					colorFiles_.insert(std::make_pair(stamp, path_+"/mav0/rgb/data/"+ns+".png"));
+				}
+			}
+		}
+		if(colorFiles_.empty())
+		{
+			colorModel_ = CameraModel();
+		}
 		return true;
 	}
 
+	const CameraModel & colorModel() const {return colorModel_;}
 	bool finished() const {return finished_;}
 	int totalFrames() const {return totalFrames_;}
 
@@ -426,6 +505,24 @@ private:
 				this->post(new IMUEvent(imuData_.imu(), imuData_.stamp()));
 			}
 		}
+		if(!colorFiles_.empty())
+		{
+			// closest color frame, as user data (same as CameraRealSense2::setColorWithIR())
+			std::map<double, std::string>::iterator iter = colorFiles_.lower_bound(data.stamp());
+			if(iter != colorFiles_.begin() && (iter == colorFiles_.end() || fabs(std::prev(iter)->first - data.stamp()) < fabs(iter->first - data.stamp())))
+			{
+				--iter;
+			}
+			if(iter != colorFiles_.end() && fabs(iter->first - data.stamp()) < 0.05)
+			{
+				cv::Mat color = cv::imread(iter->second, cv::IMREAD_COLOR);
+				std::vector<unsigned char> jpg;
+				if(!color.empty() && cv::imencode(".jpg", color, jpg, std::vector<int>{cv::IMWRITE_JPEG_QUALITY, 90}))
+				{
+					data.setUserData(cv::Mat(1, (int)jpg.size(), CV_8UC1, jpg.data()).clone());
+				}
+			}
+		}
 		capture_->postUpdate(&data, &info);
 		this->post(new SensorEvent(data, info));
 	}
@@ -442,6 +539,8 @@ private:
 	double firstStamp_ = -1.0;
 	std::atomic<bool> finished_;
 	int totalFrames_ = 0;
+	CameraModel colorModel_;
+	std::map<double, std::string> colorFiles_;
 };
 
 struct EngineSettings
@@ -494,6 +593,8 @@ public:
 			return false;
 		}
 		ParametersMap params = settings.parameters;
+		CloudParams cloudParams = settings.cloud;
+		cloudParams.color = loadColorModel(settings.db);
 		uInsert(params, ParametersPair(Parameters::kMemIncrementalMemory(), "false"));
 		uInsert(params, ParametersPair(Parameters::kMemInitWMWithAllNodes(), "true"));
 		uInsert(params, ParametersPair(Parameters::kRtabmapWorkingDirectory(), tmpDir()));
@@ -501,7 +602,7 @@ public:
 		UFile::erase(tmp);
 		UFile::copy(settings.db, tmp);
 		{
-			CloudWorker clouds(listener_, settings.cloud);
+			CloudWorker clouds(listener_, cloudParams);
 			Rtabmap rtabmap;
 			rtabmap.init(params, tmp);
 			sendMap(rtabmap, clouds);
@@ -511,6 +612,24 @@ public:
 		UFile::erase(tmp);
 		return true;
 	}
+
+	// color camera calibration saved next to a map: MAP_color.yaml
+	static std::string colorModelName(const std::string & db)
+	{
+		std::string name = UFile::getName(db);
+		return name.substr(0, name.find_last_of('.')) + "_color";
+	}
+	static CameraModel loadColorModel(const std::string & db)
+	{
+		CameraModel model;
+		std::string dir = UDirectory::getDir(db);
+		if(UFile::exists(dir + "/" + colorModelName(db) + ".yaml"))
+		{
+			model.load(dir, colorModelName(db));
+		}
+		return model;
+	}
+	const CameraModel & colorModel() const {return colorModel_;}
 
 	bool start(const EngineSettings & settings, std::string & error)
 	{
@@ -555,8 +674,10 @@ public:
 				replay_ = 0;
 				return false;
 			}
-			listener_->engineStatus(tr8("녹화 재생: %1 (%2 프레임, %3배속)")
-					.arg(QString::fromStdString(settings.euroc)).arg(replay_->totalFrames()).arg(settings.rate), 0);
+			listener_->engineStatus(tr8("녹화 재생: %1 (%2 프레임, %3배속, %4)")
+					.arg(QString::fromStdString(settings.euroc)).arg(replay_->totalFrames()).arg(settings.rate)
+					.arg(replay_->colorModel().isValidForProjection()?tr8("컬러 있음"):tr8("컬러 없음: --rgb로 변환한 녹화가 아님")), 0);
+			colorModel_ = replay_->colorModel();
 		}
 		else
 		{
@@ -570,6 +691,7 @@ public:
 			camera->setIRFormat(true, false);
 			camera->setResolution(settings.width, settings.height, settings.fps);
 			camera->setInterIMUPublishing(true, IMUFilter::create(IMUFilter::kComplementaryFilter, parameters), false);
+			camera->setColorWithIR(true, 640, 480);
 			listener_->engineStatus(tr8("D435i 연결 중..."), 0);
 			if(!camera->init(calibDir, ""))
 			{
@@ -579,11 +701,29 @@ public:
 			}
 			listener_->engineStatus(tr8("D435i 시작: IR 스테레오 %1x%2 %3 Hz + IMU (시리얼 %4)")
 					.arg(settings.width).arg(settings.height).arg(settings.fps).arg(QString::fromStdString(camera->getSerial())), 0);
+			colorModel_ = camera->colorModel();
+			if(!colorModel_.isValidForProjection())
+			{
+				listener_->engineStatus(tr8("컬러 스트림 없이 진행합니다 (IR만)."), 1);
+			}
 			capture_ = new SensorCaptureThread(camera, parameters);
 		}
 
 		// SLAM
-		clouds_ = new CloudWorker(listener_, settings.cloud);
+		CloudParams cloudParams = settings.cloud;
+		cloudParams.color = colorModel_;
+		if(localization_)
+		{
+			// map clouds: color camera of the map
+			cloudParams.color = loadColorModel(settings.db);
+		}
+		else if(colorModel_.isValidForProjection())
+		{
+			CameraModel saved = colorModel_;
+			saved.setName(colorModelName(settings.db));
+			saved.save(UDirectory::getDir(settings.db));
+		}
+		clouds_ = new CloudWorker(listener_, cloudParams);
 		Rtabmap * rtabmap = new Rtabmap();
 		listener_->engineStatus(localization_?tr8("맵 불러오는 중..."):tr8("새 맵: %1").arg(QString::fromStdString(settings.db)), 0);
 		rtabmap->init(parameters, workingDb_);
@@ -702,7 +842,17 @@ protected:
 					mapPose = mapCorrection_ * e.pose();
 				}
 			}
-			listener_->engineOdometry(e.pose(), mapPose, e.info(), e.data().imageRaw(), e.data().stamp());
+			// color image ~10 Hz (JPEG decoding)
+			cv::Mat color;
+			if(colorTimer_.elapsed() > 0.1)
+			{
+				color = colorImage(e.data());
+				if(!color.empty())
+				{
+					colorTimer_.restart();
+				}
+			}
+			listener_->engineOdometry(e.pose(), mapPose, e.info(), e.data().imageRaw(), color, e.data().stamp());
 		}
 		else if(event->getClassName().compare("RtabmapEvent") == 0)
 		{
@@ -745,7 +895,7 @@ private:
 		std::map<int, Transform> poses;
 		std::multimap<int, Link> links;
 		std::map<int, Signature> signatures;
-		rtabmap.getGraph(poses, links, true, true, &signatures, true, false, false, false, true, false);
+		rtabmap.getGraph(poses, links, true, true, &signatures, true, false, true, false, true, false);
 		listener_->engineGraph(poses, links, true, 0, 0, 0.0f, Transform());
 		for(std::map<int, Signature>::iterator iter=signatures.begin(); iter!=signatures.end(); ++iter)
 		{
@@ -773,6 +923,8 @@ private:
 	std::atomic<bool> running_;
 	std::mutex mutex_;
 	Transform mapCorrection_;
+	CameraModel colorModel_;
+	UTimer colorTimer_;
 };
 
 // ================================================================ window
@@ -878,7 +1030,7 @@ protected:
 		gui([this, text, level]{log(text, level);});
 	}
 
-	virtual void engineOdometry(const Transform & odomPose, const Transform & mapPose, const OdometryInfo & info, const cv::Mat & image, double stamp)
+	virtual void engineOdometry(const Transform & odomPose, const Transform & mapPose, const OdometryInfo & info, const cv::Mat & image, const cv::Mat & color, double stamp)
 	{
 		// only the latest frame is drawn (by the render timer), so that a slow display
 		// never queues up behind the camera
@@ -886,7 +1038,7 @@ protected:
 		if(!image.empty() && imageTimer_.elapsed() > 100)
 		{
 			imageTimer_.restart();
-			cv::Mat thumb = image;
+			cv::Mat thumb = color.empty()?image:color;
 			if(thumb.cols > 640)
 			{
 				cv::resize(image, thumb, cv::Size(), 0.5, 0.5, cv::INTER_AREA);
@@ -1303,17 +1455,21 @@ private:
 		if(fi.isDir())
 		{
 			if(QDir(path).exists("mav0")) return path;
+			if(QDir(path + "/euroc_rgb").exists("mav0")) return path + "/euroc_rgb";
 			if(QDir(path + "/euroc").exists("mav0")) return path + "/euroc";
 			return QString();
 		}
 		if(fi.isFile())
 		{
+			// prefer conversions that include the color stream (euroc_rgb)
 			QString stem = fi.completeBaseName();
-			QStringList candidates;
-			candidates << fi.dir().absoluteFilePath(stem + "/euroc");
 			QDir root(QCoreApplication::applicationDirPath());
 			root.cdUp();
 			root.cdUp();
+			QStringList candidates;
+			candidates << fi.dir().absoluteFilePath(stem + "/euroc_rgb");
+			candidates << root.absoluteFilePath("out/" + stem + "/euroc_rgb");
+			candidates << fi.dir().absoluteFilePath(stem + "/euroc");
 			candidates << root.absoluteFilePath("out/" + stem + "/euroc");
 			for(const QString & c : candidates)
 			{
@@ -1435,9 +1591,16 @@ private:
 		{
 			QString rec = recPath_->text().trimmed();
 			QString euroc = rec.isEmpty()?QString():findEuroc(rec);
+			bool isRecording = QFileInfo(rec).isFile() && (rec.endsWith(".bag", Qt::CaseInsensitive) || rec.endsWith(".db3", Qt::CaseInsensitive));
+			if(!euroc.isEmpty() && isRecording && !euroc.endsWith("euroc_rgb") && !QDir(euroc + "/mav0").exists("rgb"))
+			{
+				// older conversion without color: convert again once with --rgb
+				log(tr8("기존 변환본에 컬러(RGB)가 없어 컬러 포함으로 다시 변환합니다: %1").arg(euroc));
+				euroc.clear();
+			}
 			if(euroc.isEmpty())
 			{
-				if(QFileInfo(rec).isFile() && (rec.endsWith(".bag", Qt::CaseInsensitive) || rec.endsWith(".db3", Qt::CaseInsensitive)))
+				if(isRecording)
 				{
 					convertRecording(rec, mode);
 					return;
@@ -1588,7 +1751,7 @@ private:
 	void convertRecording(const QString & rec, EngineSettings::Mode mode)
 	{
 		QFileInfo fi(rec);
-		QString out = QDir::toNativeSeparators(fi.dir().absoluteFilePath(fi.completeBaseName() + "/euroc"));
+		QString out = QDir::toNativeSeparators(fi.dir().absoluteFilePath(fi.completeBaseName() + "/euroc_rgb"));
 		QString tools = qEnvironmentVariable("RTABMAP_TOOLS");
 		QString script = QDir(tools).absoluteFilePath("RealSense/realsense_bag_to_euroc.py");
 		if(tools.isEmpty() || !QFileInfo(script).isFile())
@@ -1611,7 +1774,7 @@ private:
 			convert_->deleteLater();
 			convert_ = 0;
 			setRunning(false);
-			if(code == 0 && !findEuroc(rec).isEmpty())
+			if(code == 0 && findEuroc(rec).endsWith("euroc_rgb"))
 			{
 				log(tr8("변환 완료"));
 				start(mode);
@@ -1622,7 +1785,7 @@ private:
 				standby(tr8("변환 실패"), "#a33");
 			}
 		});
-		convert_->start("python", QStringList() << script << rec << out);
+		convert_->start("python", QStringList() << script << rec << out << "--rgb");
 	}
 
 	void poll()
