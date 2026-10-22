@@ -49,10 +49,14 @@ view), run with the environment of `rtabmap_env.bat`:
 - **2. 실시간 로컬라이제이션**: shows a saved map, then localizes the live camera in it (the map
   file is not modified): current pose, live path, map matches in green. The features (ORB or
   ALIKED + LightGlue) follow the map.
-- **파일 > 맵 불러오기**: any RTAB-Map `.db`, offline, with the stereo point clouds.
+- **파일 > 맵 불러오기**: any RTAB-Map `.db`, offline, with the stereo point clouds;
+  **파일 > 녹화 파일 열기**: a recording to replay.
+- When a task ends (recording finished, camera stopped, map saved or opened) the viewer goes back
+  to standby ("대기 중") and waits for the next one (live camera, recording or map). It closes only
+  when the user quits (파일 > 종료 or the window's close button).
 
-`--auto map|loc|view --source realsense|REC --db OUT_DIR_OR_MAP [--screenshot out.png]` runs one
-module unattended (tests).
+`--auto map|loc|view --source realsense|REC --db OUT_DIR_OR_MAP [--screenshot out.png] [--exit]` starts
+one module at startup, then waits in standby; `--exit` closes the viewer at the end (unattended tests).
 
 ## Recordings
 

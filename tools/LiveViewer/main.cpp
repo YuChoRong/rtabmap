@@ -814,12 +814,14 @@ public:
 		{
 			log(tr8("이 빌드에는 RealSense2 드라이버가 없습니다: 녹화 파일만 쓸 수 있습니다."), 1);
 		}
+		standby();
 		autoArgs_ = args;
 	}
 
 	void runAutoArgs()
 	{
-		// --auto map|loc|view --source realsense|REC --db OUT_DIR_OR_MAP [--rate F] [--screenshot PNG]
+		// --auto map|loc|view --source realsense|REC --db OUT_DIR_OR_MAP [--rate F] [--screenshot PNG] [--exit]
+		// the window then waits in standby for the next task; only --exit (scripts) closes it at the end
 		QString mode, source, db;
 		for(int i=1; i<autoArgs_.size(); ++i)
 		{
@@ -831,6 +833,7 @@ public:
 			else if(a == "--rate" && v) rate_->setValue(autoArgs_[++i].toDouble());
 			else if(a == "--features" && v) features_->setCurrentIndex(autoArgs_[++i] == "aliked"?1:0);
 			else if(a == "--screenshot" && v) screenshot_ = autoArgs_[++i];
+			else if(a == "--exit") exitWhenDone_ = true;
 			else if(a == "--open" && v) {openMap(autoArgs_[++i]); return;}
 		}
 		if(mode.isEmpty())
@@ -855,7 +858,7 @@ protected:
 		saveSettings();
 		if(engine_.running() || busy_)
 		{
-			if(!autoMode_ && QMessageBox::question(this, tr8("종료"),
+			if(!exitWhenDone_ && QMessageBox::question(this, tr8("종료"),
 					tr8("실행 중입니다. 정지하고 종료할까요? (매핑 중이면 맵을 저장합니다)")) != QMessageBox::Yes)
 			{
 				event->ignore();
@@ -1092,7 +1095,7 @@ private:
 		state_ = new QLabel(tr8("대기"));
 		state_->setAlignment(Qt::AlignCenter);
 		rl->addWidget(state_);
-		setState(tr8("대기"), "#444");
+		setState(tr8("대기 중"), "#444");
 		QFormLayout * form = new QFormLayout;
 		const char * keys[][2] = {
 				{"mode", "모드"}, {"fps", "카메라 FPS"}, {"odom", "VIO 처리 시간"}, {"inliers", "VIO 특징점 (인라이어/전체)"},
@@ -1131,6 +1134,7 @@ private:
 			QString f = QFileDialog::getOpenFileName(this, tr8("맵 불러오기"), locMap_->text().isEmpty()?outDir_->text():locMap_->text(), "RTAB-Map (*.db)");
 			if(!f.isEmpty()) openMap(QDir::toNativeSeparators(f));
 		});
+		connect(m->addAction(tr8("녹화 파일 열기...")), &QAction::triggered, this, [this]{browseRecording();});
 		recentMenu_ = m->addMenu(tr8("최근 맵"));
 		updateRecent();
 		m->addSeparator();
@@ -1167,6 +1171,25 @@ private:
 		logView_->appendPlainText(line);
 		printf("%s\n", line.toUtf8().constData());
 		fflush(stdout);
+	}
+
+	// nothing running: waits for the next task (live camera, recording or map), until the user quits
+	void standby(const QString & done = QString(), const QString & color = "#2a5d9f")
+	{
+		QString wait = tr8("대기 중 - 카메라/녹화 파일로 매핑·로컬라이제이션을 시작하거나 맵을 여세요");
+		if(done.isEmpty())
+		{
+			setState(tr8("대기 중"), "#444");
+		}
+		else
+		{
+			setState(done + tr8(" · 대기 중"), color);
+		}
+		state_->setToolTip(wait);
+		if(!logView_->toPlainText().endsWith(wait))
+		{
+			log(wait);
+		}
 	}
 
 	void setState(const QString & text, const QString & color)
@@ -1453,7 +1476,7 @@ private:
 				if(!ok)
 				{
 					log(tr8("시작 실패: %1").arg(QString::fromStdString(error)), 2);
-					setState(tr8("시작 실패"), "#a33");
+					standby(tr8("시작 실패"), "#a33");
 					setRunning(false);
 					mode_ = -1;
 					finishAuto();
@@ -1500,11 +1523,11 @@ private:
 					log(tr8("맵 저장 완료: %1 (키프레임 %2개). 로컬라이제이션 맵으로 설정했습니다.").arg(path).arg(nodes));
 					locMap_->setText(path);
 					addRecent(path);
-					setState(tr8("맵 저장 완료"), "#2a5d9f");
+					standby(tr8("맵 저장 완료"));
 				}
 				else
 				{
-					setState(tr8("정지"), "#555");
+					standby(tr8("로컬라이제이션 종료"));
 				}
 				finishAuto();
 			});
@@ -1549,13 +1572,13 @@ private:
 				mode_ = -1;
 				if(ok)
 				{
-					setState(tr8("맵 보기: 키프레임 %1개").arg(poses_.size()), "#2a5d9f");
+					standby(tr8("맵 보기: 키프레임 %1개").arg(poses_.size()));
 					fitView();
 				}
 				else
 				{
 					log(tr8("맵을 열 수 없습니다: %1").arg(QString::fromStdString(error)), 2);
-					setState(tr8("맵 열기 실패"), "#a33");
+					standby(tr8("맵 열기 실패"), "#a33");
 				}
 				finishAuto();
 			});
@@ -1596,7 +1619,7 @@ private:
 			else
 			{
 				log(tr8("변환 실패 (코드 %1)").arg(code), 2);
-				setState(tr8("변환 실패"), "#a33");
+				standby(tr8("변환 실패"), "#a33");
 			}
 		});
 		convert_->start("python", QStringList() << script << rec << out);
@@ -1625,13 +1648,19 @@ private:
 		{
 			return;
 		}
-		QTimer::singleShot(1500, this, [this]{
-			if(!screenshot_.isEmpty())
+		// back to the normal interactive mode: the window stays open (standby)
+		// and is closed only by the user, or by --exit for scripts
+		autoMode_ = false;
+		bool doExit = exitWhenDone_;
+		QString shot = screenshot_;
+		screenshot_.clear();
+		QTimer::singleShot(1500, this, [this, doExit, shot]{
+			if(!shot.isEmpty())
 			{
 				fitView();
-				QTimer::singleShot(800, this, [this]{saveScreenshot(screenshot_); close();});
+				QTimer::singleShot(800, this, [this, doExit, shot]{saveScreenshot(shot); if(doExit) close();});
 			}
-			else
+			else if(doExit)
 			{
 				close();
 			}
@@ -1899,6 +1928,7 @@ private:
 	int mode_;
 	bool autoMode_ = false;
 	QString screenshot_;
+	bool exitWhenDone_ = false;
 	QStringList autoArgs_;
 	QProcess * convert_ = 0;
 
@@ -1953,9 +1983,10 @@ int main(int argc, char * argv[])
 		if(strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0)
 		{
 			printf("rtabmap-live_viewer [--open MAP.db]\n"
-				   "  [--auto map|loc|view --source realsense|RECORDING --db OUT_DIR_OR_MAP [--rate F] [--features orb|aliked] [--screenshot OUT.png]]\n"
+				   "  [--auto map|loc|view --source realsense|RECORDING --db OUT_DIR_OR_MAP [--rate F] [--features orb|aliked] [--screenshot OUT.png] [--exit]]\n"
 				   "Real-time mapping and localization with a D435i (IR stereo + IMU) or a recording,\n"
-				   "and offline map viewing. --auto runs one module and exits when it ends.\n");
+				   "and offline map viewing. --auto starts one module, the viewer then waits\n"
+				   "in standby for the next task (camera, recording or map); --exit closes it at the end (scripts).\n");
 			return 0;
 		}
 	}
