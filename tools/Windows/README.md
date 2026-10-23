@@ -8,13 +8,31 @@ driver and the GUI (`-NoGui` for the command-line tools only).
    (python.org, "Add python.exe to PATH"), and the NVIDIA driver.
 2. In cmd.exe:
    ```
-   git clone -b claude/project-thread-vev8qn https://github.com/yuchorong/rtabmap C:\slam\src
+   git clone -b claude/project-thread-rwmhjg https://github.com/yuchorong/rtabmap C:\slam\src
    C:\slam\src\tools\Windows\build_windows.bat -Root C:\slam
    ```
    The PyTorch CUDA build is chosen from `nvidia-smi` (`-Cuda cu126` etc. to force it,
    `-Cuda cpu` without NVIDIA GPU). The first run builds OpenCV, PCL, Qt, VTK, GTSAM and
    librealsense with vcpkg (2-3 hours); running it again only rebuilds RTAB-Map.
    It ends by printing the RTAB-Map version and the GPU seen by PyTorch.
+
+   A build folder (`-Root\build`) belongs to one source folder: to build another copy of
+   the sources (e.g. an unzipped download) with the same `-Root`, delete `-Root\build`
+   first (vcpkg and the venv are reused), or use another `-Root`. An Anaconda/Miniconda in
+   the PATH is ignored, so that all libraries come from vcpkg.
+
+## Portable package (another PC without building)
+
+```
+C:\slam\src\tools\Windows\make_portable.bat -Root C:\slam -Out D:\rtabmap_portable
+```
+makes `D:\rtabmap_portable` and `D:\rtabmap_portable.zip` (~6.5 GB, ~3 GB zipped, mostly
+PyTorch with CUDA): RTAB-Map, all its DLLs, the MSVC runtime, Python with the venv packages
+and the ALIKED/LightGlue weights. On the other PC (Windows 10/11 x64), unzip to a short path
+(e.g. `C:\rtabmap`) and run `live_viewer.bat` (`cmd.bat`: a command prompt with
+`rtabmap-*.exe` and `python`). Only an NVIDIA driver is needed for ALIKED + LightGlue on the
+GPU; ORB works on any PC. `-NoZip` skips the zip. The script checks the package with a
+clean PATH before zipping it.
 
 ## Live D435i
 

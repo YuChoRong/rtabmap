@@ -35,6 +35,16 @@ function Check($what) { if ($LASTEXITCODE -ne 0) { throw "$what failed (exit cod
 
 if ($Root.Length -gt 12) { Write-Warning "Long -Root paths can break the vcpkg builds (Windows path limit), prefer e.g. C:\slam" }
 New-Item -ItemType Directory -Force -Path $Root -ErrorAction Stop | Out-Null
+# a build folder belongs to one source folder (CMake cache): say it now, not after the dependencies
+$cache = Join-Path $Build "CMakeCache.txt"
+if (Test-Path $cache) {
+    $cachedSource = ((Select-String -Path $cache -Pattern '^CMAKE_HOME_DIRECTORY:INTERNAL=(.*)$').Matches | Select-Object -First 1).Groups[1].Value
+    if ($cachedSource -and ((Resolve-Path $cachedSource -ErrorAction SilentlyContinue).Path -ne $Source)) {
+        throw ("$Build was configured from another source folder ($cachedSource), not $Source.`n" +
+               "Either delete $Build (vcpkg and the venv of $Root are reused, only RTAB-Map is rebuilt),`n" +
+               "or build this source with another -Root (dependencies are built again, 2-3 hours).")
+    }
+}
 
 Step "1/6 Check Visual Studio, Git, Python"
 if (-not (Get-Command git -ErrorAction SilentlyContinue)) { throw "Git not found: install it from https://git-scm.com/download/win" }
@@ -109,7 +119,8 @@ $packages = @(
     "eigen3", "zlib", "boost-crc",  # boost-crc: FlannIndex.cpp
     "opencv4[core,calib3d,contrib,fs,highgui,intrinsics,jpeg,png,thread,win32ui]",
     "gtsam[core,boost]",           # overlay port with gtsam_unstable (fixed-lag smoother of the VIO)
-    "realsense2[core]"             # live D435i (Apache-2.0)
+    "realsense2[core]",            # live D435i (Apache-2.0)
+    "yaml-cpp"                     # EuRoC calibration of rtabmap-live_viewer / euroc_dataset (MIT)
 )
 if ($NoGui) {
     $packages += "pcl[core]"
@@ -125,6 +136,18 @@ Pop-Location
 if ($code -ne 0) { throw "vcpkg install failed (exit code $code), see the log named above" }
 
 Step "5/6 Configure and build RTAB-Map ($Build)"
+# Only vcpkg's libraries: an Anaconda/Miniconda in the PATH would otherwise provide some
+# packages (yaml-cpp, tiff), and the build would not run on a PC without it.
+$condaRoots = @($env:PATH -split ';' | Where-Object { $_ -match 'conda|mamba' } |
+    ForEach-Object { ($_.TrimEnd('\') -replace '\\(Library\\)?(bin|Scripts|mingw-w64\\bin|usr\\bin)$', '') }) + @($env:CONDA_PREFIX) |
+    Where-Object { $_ } | Sort-Object -Unique
+if ($condaRoots) {
+    Write-Host "Ignoring conda for this build: $($condaRoots -join ', ')"
+    $env:PATH = ($env:PATH -split ';' | Where-Object { $_ -notmatch 'conda|mamba' }) -join ';'
+    Remove-Item Env:CONDA_PREFIX -ErrorAction SilentlyContinue
+}
+$ignorePrefixes = (@($condaRoots) + @($condaRoots | ForEach-Object { "$_\Library" }) | Where-Object { $_ }) -join ';'
+$vcpkgShare = Join-Path $Vcpkg "installed\$Triplet\share"
 $gui = if ($NoGui) { "OFF" } else { "ON" }
 cmake -S $Source -B $Build -G Ninja `
     -DCMAKE_BUILD_TYPE=Release `
@@ -137,7 +160,9 @@ cmake -S $Source -B $Build -G Ninja `
     -DWITH_GTSAM=ON -DWITH_REALSENSE2=ON `
     -DWITH_OPENVINS=OFF -DWITH_ORB_OCTREE=OFF -DWITH_TORCH=OFF `
     -DWITH_PDAL=OFF -DWITH_OCTOMAP=OFF -DWITH_G2O=OFF -DWITH_CERES=OFF `
-    -DBUILD_EXAMPLES=OFF -DBUILD_TOOLS=ON -DBUILD_APP=ON
+    -DBUILD_EXAMPLES=OFF -DBUILD_TOOLS=ON -DBUILD_APP=ON `
+    "-DCMAKE_IGNORE_PREFIX_PATH=$ignorePrefixes" `
+    "-Dyaml-cpp_DIR=$vcpkgShare\yaml-cpp" "-Dtiff_DIR=$vcpkgShare\tiff"
 Check "CMake configuration"
 cmake --build $Build --parallel $Jobs; Check "Build"
 cmake --install $Build; Check "Install"
