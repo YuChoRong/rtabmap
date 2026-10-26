@@ -218,7 +218,7 @@ def train(args, cameras, images, xyz, rgb):
                   for k, lr in lrs.items()}
     # Position learning rate decays to 1% over the training
     means_scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizers['means'], gamma=0.01 ** (1.0 / args.steps))
-    strategy = DefaultStrategy(refine_stop_iter=min(15000, args.steps // 2), verbose=False,
+    strategy = DefaultStrategy(refine_stop_iter=min(15000, args.steps // 2), verbose=False, grow_grad2d=args.grow_grad,
                                key_for_gradient='gradient_2dgs' if two_d else 'means2d')
     strategy.check_sanity(params, optimizers)
     state = strategy.initialize_state(scene_scale=scene_scale)
@@ -264,6 +264,10 @@ def train(args, cameras, images, xyz, rgb):
             opt.zero_grad(set_to_none=True)
         means_scheduler.step()
         strategy.step_post_backward(params, optimizers, state, step, info, packed=False)
+        if args.max_gaussians > 0 and params['means'].shape[0] > args.max_gaussians and strategy.refine_stop_iter > step:
+            # Memory and time grow with the count: stop densifying (and pruning) here
+            print('%d Gaussians > --max-gaussians at step %d: densification stopped' % (params['means'].shape[0], step))
+            strategy.refine_stop_iter = step
         if step % 500 == 0 or step == args.steps - 1:
             print('step %d/%d loss %.4f, %d Gaussians, %.0f s' % (step, args.steps, loss.item(), params['means'].shape[0], time.time() - start))
 
@@ -307,6 +311,8 @@ def main():
     parser.add_argument('--normal-from', type=int, default=7000, help='2dgs: step where the normal loss starts')
     parser.add_argument('--dist-weight', type=float, default=0.01, help='2dgs: depth distortion weight')
     parser.add_argument('--dist-from', type=int, default=3000, help='2dgs: step where the distortion loss starts')
+    parser.add_argument('--grow-grad', type=float, default=0.0002, help='Densification threshold of the 2D position gradient (higher = fewer Gaussians)')
+    parser.add_argument('--max-gaussians', type=int, default=3000000, help='Densification stops above this count (0 = no limit)')
     parser.add_argument('--test-every', type=int, default=8, help='Hold out every Nth image for evaluation (0 = none)')
     parser.add_argument('--device', default='cuda', help=argparse.SUPPRESS)  # tests only: gsplat needs CUDA
     parser.add_argument('--check', action='store_true', help='Load the data, write a test PLY of the initial points, and exit (no torch)')
