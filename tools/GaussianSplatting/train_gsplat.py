@@ -11,10 +11,15 @@ code, no gsplat example scripts. Dependencies: torch (CUDA), gsplat, numpy, Pill
 - Gaussians start at the points of points3D.txt (the RTAB-Map stereo cloud).
 - Loss 0.8 L1 + 0.2 (1 - SSIM); densification and pruning by gsplat's DefaultStrategy;
   spherical harmonics up to degree 3.
+- --mode 2dgs trains 2D Gaussians (flat disks, gsplat's rasterization_2dgs) with the
+  depth distortion and normal consistency losses of 2DGS (Huang et al. 2024, implemented
+  here from the paper): their surfaces give much cleaner meshes (extract_mesh.py).
+- When DATA/depths/<image>.png exists (16-bit mm, from rtabmap_to_colmap.py --euroc),
+  the rendered depth is also fitted to it (--depth-weight).
 - Every --test-every image is held out: PSNR / SSIM on them are written to
   OUTPUT/stats.json and the renders to OUTPUT/renders.
 - The model is saved as OUTPUT/point_cloud.ply in the usual 3DGS PLY layout
-  (readable by 3DGS viewers such as SuperSplat).
+  (readable by 3DGS viewers such as SuperSplat), with OUTPUT/model.json (mode, SH degree).
 
 --check loads the data and prints a summary without torch (no GPU needed).
 """
@@ -88,8 +93,11 @@ def read_colmap_text(root):
 
 
 def load_images(root, cameras, images, factor):
-    """RGB images as uint8 arrays (grayscale images are expanded), with intrinsics scaled by factor."""
+    """RGB images as uint8 arrays (grayscale images are expanded), with intrinsics scaled by factor.
+    Depth maps of DATA/depths (16-bit mm) are loaded as float meters when present (else None)."""
     for im in images:
+        im['depth'] = None
+        depth_path = os.path.join(root, 'depths', os.path.splitext(im['name'])[0] + '.png')
         path = os.path.join(root, 'images', im['name'])
         img = Image.open(path).convert('RGB')
         cam = cameras[im['camera']]
@@ -97,6 +105,11 @@ def load_images(root, cameras, images, factor):
         if img.size != (w, h):
             img = img.resize((w, h), Image.BICUBIC)
         im['image'] = np.asarray(img)
+        if os.path.exists(depth_path):
+            depth = Image.open(depth_path)
+            if depth.size != (w, h):
+                depth = depth.resize((w, h), Image.NEAREST)
+            im['depth'] = np.asarray(depth).astype(np.float32) / 1000.0
         K = cam['K'].copy()
         K[:2] /= factor
         im['K'] = K
@@ -158,10 +171,10 @@ def knn_distance(points, k=3, chunk=2048):
 
 def train(args, cameras, images, xyz, rgb):
     import torch
-    from gsplat import rasterization
+    from gsplat import rasterization, rasterization_2dgs
     from gsplat.strategy import DefaultStrategy
 
-    device = torch.device('cuda')
+    device = torch.device(args.device)
     torch.manual_seed(0)
     test = [im for k, im in enumerate(images) if args.test_every > 0 and k % args.test_every == 0]
     trainset = [im for k, im in enumerate(images) if not (args.test_every > 0 and k % args.test_every == 0)]
@@ -175,6 +188,11 @@ def train(args, cameras, images, xyz, rgb):
                 torch.tensor(np.stack([im['K'] for im in ims]), dtype=torch.float32, device=device))
     train_images, train_viewmats, train_Ks = to_gpu(trainset)
     height, width = train_images.shape[1:3]
+    # Depth maps stay on the CPU (one is copied per step), 0 = unknown
+    train_depths = [torch.from_numpy(im['depth']) if im['depth'] is not None else None for im in trainset]
+    use_depth = args.depth_weight > 0 and any(d is not None for d in train_depths)
+    two_d = args.mode == '2dgs'
+    print('Mode %s, depth supervision %s' % (args.mode, 'on (%d depth maps)' % sum(d is not None for d in train_depths) if use_depth else 'off'))
 
     # Gaussians
     means = torch.tensor(xyz, device=device)
@@ -183,9 +201,12 @@ def train(args, cameras, images, xyz, rgb):
     sh_degree = args.sh_degree
     colors = torch.zeros(n, (sh_degree+1)**2, 3, device=device)
     colors[:, 0] = (torch.tensor(rgb, device=device) - 0.5) / 0.28209479177387814  # RGB -> SH DC
+    scales = torch.log(dist)[:, None].repeat(1, 3)
+    if two_d:
+        scales[:, 2] = math.log(1e-6)  # disks: the third axis is not used by rasterization_2dgs
     params = torch.nn.ParameterDict({
         'means': torch.nn.Parameter(means),
-        'scales': torch.nn.Parameter(torch.log(dist)[:, None].repeat(1, 3)),
+        'scales': torch.nn.Parameter(scales),
         'quats': torch.nn.Parameter(torch.rand(n, 4, device=device)),
         'opacities': torch.nn.Parameter(torch.logit(torch.full((n,), 0.1, device=device))),
         'sh0': torch.nn.Parameter(colors[:, :1]),
@@ -197,26 +218,46 @@ def train(args, cameras, images, xyz, rgb):
                   for k, lr in lrs.items()}
     # Position learning rate decays to 1% over the training
     means_scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizers['means'], gamma=0.01 ** (1.0 / args.steps))
-    strategy = DefaultStrategy(refine_stop_iter=min(15000, args.steps // 2), verbose=False)
+    strategy = DefaultStrategy(refine_stop_iter=min(15000, args.steps // 2), verbose=False,
+                               key_for_gradient='gradient_2dgs' if two_d else 'means2d')
     strategy.check_sanity(params, optimizers)
     state = strategy.initialize_state(scene_scale=scene_scale)
 
     def render(viewmats, Ks, degree):
-        out, _, info = rasterization(
-            params['means'], params['quats'], torch.exp(params['scales']), torch.sigmoid(params['opacities']),
-            torch.cat([params['sh0'], params['shN']], 1), viewmats, Ks, width, height,
-            sh_degree=degree, packed=False)
-        return out.clamp(0, 1), info
+        """Returns (rgb [1, H, W, 3], expected depth [1, H, W], extras, info)."""
+        args3 = (params['means'], params['quats'], torch.exp(params['scales']), torch.sigmoid(params['opacities']),
+                 torch.cat([params['sh0'], params['shN']], 1), viewmats, Ks, width, height)
+        if two_d:
+            out, alphas, normals, surf_normals, distort, median, info = rasterization_2dgs(
+                *args3, sh_degree=degree, packed=False, render_mode='RGB+ED', distloss=True)
+            extras = dict(alphas=alphas, normals=normals, surf_normals=surf_normals, distort=distort, median=median)
+        else:
+            out, alphas, info = rasterization(*args3, sh_degree=degree, packed=False, render_mode='RGB+ED')
+            extras = dict(alphas=alphas)
+        return out[..., :3].clamp(0, 1), out[..., 3], extras, info
 
     start = time.time()
     for step in range(args.steps):
         k = torch.randint(len(trainset), (1,)).item()
         gt = train_images[k:k+1].float() / 255.0
         degree = min(step // 1000, sh_degree)
-        image, info = render(train_viewmats[k:k+1], train_Ks[k:k+1], degree)
+        image, depth, extras, info = render(train_viewmats[k:k+1], train_Ks[k:k+1], degree)
         strategy.step_pre_backward(params, optimizers, state, step, info)
         l1 = (image - gt).abs().mean()
         loss = 0.8 * l1 + 0.2 * (1.0 - ssim(image.permute(0, 3, 1, 2), gt.permute(0, 3, 1, 2)))
+        if use_depth and train_depths[k] is not None:
+            target = train_depths[k].to(device)
+            valid = target > 0
+            if valid.any():
+                loss = loss + args.depth_weight * (depth[0][valid] - target[valid]).abs().mean()
+        if two_d:
+            if step >= args.normal_from:
+                # Normals of the disks agree with the normals of the rendered depth
+                cos = (extras['normals'][0] * extras['surf_normals'][0]).sum(-1)
+                loss = loss + args.normal_weight * (1.0 - cos).mean()
+            if step >= args.dist_from:
+                # Depth distortion: concentrate the blending weights of a ray on one surface
+                loss = loss + args.dist_weight * extras['distort'].mean()
         loss.backward()
         for opt in optimizers.values():
             opt.step()
@@ -228,14 +269,14 @@ def train(args, cameras, images, xyz, rgb):
 
     os.makedirs(args.output, exist_ok=True)
     with torch.no_grad():
-        stats = {'steps': args.steps, 'gaussians': int(params['means'].shape[0]), 'train_seconds': time.time() - start}
+        stats = {'mode': args.mode, 'steps': args.steps, 'gaussians': int(params['means'].shape[0]), 'train_seconds': time.time() - start}
         if test:
             test_images, test_viewmats, test_Ks = to_gpu(test)
             os.makedirs(os.path.join(args.output, 'renders'), exist_ok=True)
             psnrs, ssims = [], []
             for k, im in enumerate(test):
                 gt = test_images[k:k+1].float() / 255.0
-                image, _ = render(test_viewmats[k:k+1], test_Ks[k:k+1], sh_degree)
+                image, _, _, _ = render(test_viewmats[k:k+1], test_Ks[k:k+1], sh_degree)
                 psnrs.append((-10.0 * torch.log10(((image - gt)**2).mean())).item())
                 ssims.append(ssim(image.permute(0, 3, 1, 2), gt.permute(0, 3, 1, 2)).item())
                 side = torch.cat([gt[0], image[0]], 1)  # ground truth | render
@@ -248,6 +289,8 @@ def train(args, cameras, images, xyz, rgb):
         save_ply(os.path.join(args.output, 'point_cloud.ply'), params['means'].cpu().numpy(),
                  params['scales'].cpu().numpy(), q.cpu().numpy(), params['opacities'].cpu().numpy(),
                  params['sh0'].cpu().numpy(), params['shN'].cpu().numpy())
+        json.dump({'mode': args.mode, 'sh_degree': sh_degree, 'test_every': args.test_every, 'factor': args.factor},
+                  open(os.path.join(args.output, 'model.json'), 'w'), indent=2)
     print('Model: %s' % os.path.join(args.output, 'point_cloud.ply'))
 
 
@@ -258,7 +301,14 @@ def main():
     parser.add_argument('--steps', type=int, default=30000)
     parser.add_argument('--factor', type=int, default=1, help='Image downscale factor')
     parser.add_argument('--sh-degree', type=int, default=3)
+    parser.add_argument('--mode', choices=['3dgs', '2dgs'], default='3dgs', help='3D Gaussians, or 2D Gaussians (disks) for meshes')
+    parser.add_argument('--depth-weight', type=float, default=0.1, help='Weight of the L1 depth loss (m) when DATA/depths exists (0 = off)')
+    parser.add_argument('--normal-weight', type=float, default=0.05, help='2dgs: normal consistency weight')
+    parser.add_argument('--normal-from', type=int, default=7000, help='2dgs: step where the normal loss starts')
+    parser.add_argument('--dist-weight', type=float, default=0.01, help='2dgs: depth distortion weight')
+    parser.add_argument('--dist-from', type=int, default=3000, help='2dgs: step where the distortion loss starts')
     parser.add_argument('--test-every', type=int, default=8, help='Hold out every Nth image for evaluation (0 = none)')
+    parser.add_argument('--device', default='cuda', help=argparse.SUPPRESS)  # tests only: gsplat needs CUDA
     parser.add_argument('--check', action='store_true', help='Load the data, write a test PLY of the initial points, and exit (no torch)')
     args = parser.parse_args()
     args.output = args.output or os.path.join(args.data, '3dgs')

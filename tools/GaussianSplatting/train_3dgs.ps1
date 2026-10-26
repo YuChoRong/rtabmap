@@ -17,6 +17,7 @@ param(
     [int]$Steps = 30000,
     [int]$Factor = 1,
     [string]$Venv = (Join-Path $PSScriptRoot ".gs_env"),
+    [switch]$SetupOnly,
     [Parameter(ValueFromRemainingArguments = $true)][string[]]$Extra
 )
 $ErrorActionPreference = "Stop"
@@ -40,12 +41,12 @@ if (-not (Test-Path $python)) {
     if ($LASTEXITCODE -ne 0) { throw "venv creation failed" }
 }
 
-& $python -c "import torch, gsplat, numpy, PIL" 2>$null
+& $python -c "import torch, gsplat, numpy, PIL, cv2, open3d" 2>$null
 if ($LASTEXITCODE -ne 0) {
     & $python -m pip install --upgrade pip
     & $python -m pip install torch --index-url "https://download.pytorch.org/whl/$Cuda"
     if ($LASTEXITCODE -ne 0) { throw "PyTorch installation failed (check -Cuda, e.g. cu118, cu121, cu124, cu126)" }
-    & $python -m pip install numpy pillow
+    & $python -m pip install numpy pillow opencv-python-headless open3d
     # Pre-compiled gsplat for this PyTorch and CUDA, e.g. pt24cu124
     $tag = & $python -c "import torch; v=torch.__version__.split('+')[0].split('.'); print('pt%s%scu%s' % (v[0], v[1], torch.version.cuda.replace('.', '')))"
     # Dependencies from PyPI, then gsplat only from its wheel index (a newer PyPI version would have no binaries)
@@ -60,6 +61,7 @@ if ($LASTEXITCODE -ne 0) {
 
 & $python -c "import torch; assert torch.cuda.is_available(), 'CUDA GPU not available to PyTorch'; print('GPU:', torch.cuda.get_device_name(0))"
 if ($LASTEXITCODE -ne 0) { throw "PyTorch cannot use the GPU (driver or -Cuda version)" }
+if ($SetupOnly) { return }
 
 & $python (Join-Path $PSScriptRoot "train_gsplat.py") $Data --output $Output --steps $Steps --factor $Factor @Extra
 if ($LASTEXITCODE -ne 0) { throw "Training failed" }

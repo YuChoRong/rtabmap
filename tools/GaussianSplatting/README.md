@@ -106,6 +106,48 @@ its LSD module is AGPL. The script always uses the CPU SIFT and COLMAP is
 only used as an external tool (not redistributed). A clean COLMAP binary is
 built with `-DCUDA_ENABLED=OFF -DOPENGL_ENABLED=OFF -DLSD_ENABLED=OFF -DCGAL_ENABLED=OFF`.
 
+## 5. Mesh with 2D Gaussian Splatting (D435i recordings with color)
+
+For a recording converted with `realsense_bag_to_euroc.py --rgb` (EuRoC layout
+with the color stream in `mav0/rgb`), one command on Windows makes the map, the
+model, the mesh and the comparison with two baselines:
+
+```bat
+build_3dgs_mesh.bat -Euroc C:\slam\data\20261013_105416\euroc_rgb
+```
+
+Results in `C:\slam\out\mesh_20261013_105416` (`-Out` to change it):
+`colmap\2dgs\mesh.ply` (the mesh, vertex colors), `colmap\stereo_mesh.ply` and
+`poisson_mesh.ply` (baselines), `mesh_eval.json`. Each step is skipped when its
+result exists, so a run can be resumed. The steps, also usable alone (Linux too):
+
+```bash
+rtabmap-euroc_dataset --Odom/Strategy 15 --Rtabmap/DetectionRate 4 --output OUT --output_name map REC/euroc_rgb
+python3 rtabmap_to_colmap.py OUT/map.db OUT/colmap --euroc REC/euroc_rgb   # color images, poses, depth maps
+python3 train_gsplat.py OUT/colmap --mode 2dgs --output OUT/colmap/2dgs     # 2D Gaussians + depth supervision
+python3 extract_mesh.py OUT/colmap --model OUT/colmap/2dgs                   # TSDF fusion of the rendered depth
+python3 extract_mesh.py OUT/colmap --source stereo                          # baseline: TSDF of the stereo depth
+python3 eval_mesh.py OUT/colmap OUT/colmap/2dgs/mesh.ply OUT/colmap/stereo_mesh.ply
+```
+
+- `--euroc`: for each keyframe the nearest color image is exported, with the keyframe
+  pose interpolated at the color stamp and moved to the color camera (T_BS of the
+  `sensor.yaml` files). The depth of the keyframe's infrared pair (OpenCV SGBM) is
+  moved to the color camera as `depths/<id>.png` (16-bit mm). More keyframes
+  (`--Rtabmap/DetectionRate`) give a better model.
+- `--mode 2dgs` trains flat 2D Gaussians with the depth distortion and normal
+  consistency losses of 2DGS (Huang et al., SIGGRAPH 2024), written here on top of
+  gsplat's `rasterization_2dgs`; the original 2DGS code is not used (its license
+  forbids commercial use). The rendered depth is fitted to `depths/` (`--depth-weight`).
+- `extract_mesh.py` renders the median depth of every training image and fuses it in
+  an Open3D TSDF volume (`--voxel 0.01` m), then removes small pieces.
+- `eval_mesh.py` ray casts each mesh in the images held out from training and
+  fusion (every 8th) and compares it with their stereo depth: share of stereo pixels
+  where the mesh is within 2 / 5 cm, and median error. Stereo depth is noisy, so the
+  numbers rank meshes, they are not absolute accuracy.
+
+Licenses: gsplat Apache-2.0, PyTorch BSD-3, Open3D MIT, OpenCV Apache-2.0, numpy BSD-3, Pillow MIT-CMU.
+
 ## Windows
 
 Tested parts: the Python scripts are platform independent, the C++ viewer
