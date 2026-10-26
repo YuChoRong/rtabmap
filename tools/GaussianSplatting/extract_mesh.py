@@ -92,6 +92,8 @@ def fuse(views, images, voxel, max_depth, device, min_weight):
         attr_channels=((1), (1), (3)), voxel_size=voxel, block_resolution=8, block_count=100000, device=dev)
     count = 0
     for k, rgb, depth in views:
+        if not np.any((depth > 0) & (depth < max_depth)):
+            continue  # Open3D aborts on a view that touches no voxel
         intrinsic = o3c.Tensor(images[k]['K'], o3c.float64)
         extrinsic = o3c.Tensor(images[k]['viewmat'], o3c.float64)
         depth_img = o3d.t.geometry.Image(o3c.Tensor(np.ascontiguousarray(depth, np.float32))).to(dev)
