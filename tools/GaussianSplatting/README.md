@@ -113,7 +113,7 @@ with the color stream in `mav0/rgb`), one command on Windows makes the map, the
 model, the mesh and the comparison with two baselines:
 
 ```bat
-build_3dgs_mesh.bat -Euroc C:\slam\data\20261013_105416\euroc_rgb
+mesh_3dgs.bat -Euroc C:\slam\data\20261013_105416\euroc_rgb
 ```
 
 Results in `C:\slam\out\mesh_20261013_105416` (`-Out` to change it):
