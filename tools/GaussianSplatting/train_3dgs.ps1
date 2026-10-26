@@ -1,5 +1,7 @@
 # Trains 3D Gaussian Splatting on Windows with train_gsplat.py (gsplat library, Apache-2.0).
-# Needs an NVIDIA GPU with its driver, and Python 3.10-3.12 (python.org or conda).
+# Needs an NVIDIA GPU with its driver, and Python 3.10 (python.org or conda): the pre-compiled
+# gsplat wheels for Windows exist for cp310 + PyTorch 2.4 (cu121, cu124) only; other versions
+# compile gsplat at the first run, which needs Visual Studio Build Tools and the CUDA Toolkit.
 #
 # usage (PowerShell):
 #   .\train_3dgs.ps1 -Data colmap_v101 [-Output colmap_v101\3dgs] [-Cuda cu124] [-Steps 30000] [-Factor 1] [-Venv .gs_env]
@@ -16,21 +18,33 @@ param(
     [string]$Cuda = "cu124",
     [int]$Steps = 30000,
     [int]$Factor = 1,
-    [string]$Venv = (Join-Path $PSScriptRoot ".gs_env"),
+    [string]$Venv = "",
+    [string]$Torch = "2.4.1",
     [switch]$SetupOnly,
     [Parameter(ValueFromRemainingArguments = $true)][string[]]$Extra
 )
 $ErrorActionPreference = "Stop"
+# PowerShell 5: $PSScriptRoot is empty in param() defaults
+if (-not $Venv) { $Venv = Join-Path $PSScriptRoot ".gs_env" }
 if (-not $Output) { $Output = Join-Path $Data "3dgs" }
 
 function Find-Python {
-    foreach ($cmd in @("py -3.12", "py -3.11", "py -3.10", "python")) {
-        $exe, $arg = $cmd.Split(" ", 2)
+    # Python 3.10 first (pre-compiled gsplat), e.g. a conda environment in .py310 next to this script
+    $local = Join-Path $PSScriptRoot ".py310\python.exe"
+    $candidates = @("py -3.10")
+    if (Test-Path $local) { $candidates = @($local) + $candidates }
+    $candidates += @("py -3.12", "py -3.11", "python")
+    $ErrorActionPreference = "Continue"
+    foreach ($cmd in $candidates) {
+        $exe, $arg = if ($cmd -eq $local) { @($local, $null) } else { $cmd.Split(" ", 2) }
         if (Get-Command $exe -ErrorAction SilentlyContinue) {
-            try { & $exe $arg -c "import sys; assert (3,10) <= sys.version_info[:2] <= (3,12)" 2>$null; if ($LASTEXITCODE -eq 0) { return @($exe, $arg) } } catch {}
+            if ($arg) { & $exe $arg -c "import sys; assert (3,10) <= sys.version_info[:2] <= (3,12)" 2>$null }
+            else { & $exe -c "import sys; assert (3,10) <= sys.version_info[:2] <= (3,12)" 2>$null }
+            if ($LASTEXITCODE -eq 0) { $ErrorActionPreference = "Stop"; return @($exe, $arg) }
         }
     }
-    throw "Python 3.10-3.12 not found: install it from https://www.python.org/downloads/windows/"
+    $ErrorActionPreference = "Stop"
+    throw "Python 3.10 not found: install it from https://www.python.org/downloads/windows/ (or conda create -p .py310 python=3.10)"
 }
 
 $python = Join-Path $Venv "Scripts\python.exe"
@@ -41,10 +55,14 @@ if (-not (Test-Path $python)) {
     if ($LASTEXITCODE -ne 0) { throw "venv creation failed" }
 }
 
+# PowerShell 5 stops on redirected native stderr with "Stop"
+$ErrorActionPreference = "Continue"
 & $python -c "import torch, gsplat, numpy, PIL, cv2, open3d" 2>$null
-if ($LASTEXITCODE -ne 0) {
+$ready = ($LASTEXITCODE -eq 0)
+$ErrorActionPreference = "Stop"
+if (-not $ready) {
     & $python -m pip install --upgrade pip
-    & $python -m pip install torch --index-url "https://download.pytorch.org/whl/$Cuda"
+    & $python -m pip install "torch==$Torch" --index-url "https://download.pytorch.org/whl/$Cuda"
     if ($LASTEXITCODE -ne 0) { throw "PyTorch installation failed (check -Cuda, e.g. cu118, cu121, cu124, cu126)" }
     & $python -m pip install numpy pillow opencv-python-headless open3d
     # Pre-compiled gsplat for this PyTorch and CUDA, e.g. pt24cu124

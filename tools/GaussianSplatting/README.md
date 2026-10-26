@@ -139,6 +139,8 @@ python3 eval_mesh.py OUT/colmap OUT/colmap/2dgs/mesh.ply OUT/colmap/stereo_mesh.
   consistency losses of 2DGS (Huang et al., SIGGRAPH 2024), written here on top of
   gsplat's `rasterization_2dgs`; the original 2DGS code is not used (its license
   forbids commercial use). The rendered depth is fitted to `depths/` (`--depth-weight`).
+- Windows: Python 3.10 is used (pre-compiled gsplat wheels exist for cp310 + PyTorch 2.4 only;
+  `conda create -p tools\GaussianSplatting\.py310 python=3.10` when `py -3.10` is missing).
 - `extract_mesh.py` renders the median depth of every training image and fuses it in
   an Open3D TSDF volume (`--voxel 0.01` m), then removes small pieces.
 - `eval_mesh.py` ray casts each mesh in the images held out from training and

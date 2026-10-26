@@ -22,9 +22,11 @@ param(
     [int]$Steps = 30000,
     [int]$Factor = 1,
     [string]$Cuda = "cu124",
-    [string]$Venv = (Join-Path $PSScriptRoot ".gs_env")
+    [string]$Venv = ""
 )
 $ErrorActionPreference = "Stop"
+# PowerShell 5: $PSScriptRoot is empty in param() defaults
+if (-not $Venv) { $Venv = Join-Path $PSScriptRoot ".gs_env" }
 if (-not $Out) { $Out = Join-Path "C:\slam\out" ("mesh_" + (Split-Path (Split-Path $Euroc -Parent) -Leaf)) }
 New-Item -ItemType Directory -Force $Out | Out-Null
 $colmap = Join-Path $Out "colmap"
@@ -34,8 +36,9 @@ $python = Join-Path $Venv "Scripts\python.exe"
 # RTAB-Map tools and DLLs: PATH of rtabmap_env.bat only (its Python environment is not used here)
 $envBat = Join-Path $Install "rtabmap_env.bat"
 if (-not (Test-Path $envBat)) { throw "$envBat not found (build RTAB-Map with tools\Windows\build_windows.ps1, or give -Install)" }
-$rtabPath = (cmd /c "call `"$envBat`" >nul && echo %PATH%").Trim()
-$qtPlugins = (cmd /c "call `"$envBat`" >nul && echo %QT_PLUGIN_PATH%").Trim()
+# Delayed expansion: %PATH% would be expanded before the call
+$rtabPath = (cmd /v:on /c "call `"$envBat`" >nul && echo !PATH!").Trim()
+$qtPlugins = (cmd /v:on /c "call `"$envBat`" >nul && echo !QT_PLUGIN_PATH!").Trim()
 
 function Run-Rtabmap([string]$exe, [string[]]$arguments, [string]$log) {
     # Native tools write to stderr: do not let PowerShell 5 stop on it, check the exit code instead
@@ -61,7 +64,7 @@ function Run-Python([string[]]$arguments, [switch]$WithRtabmap) {
 }
 
 $sw = [Diagnostics.Stopwatch]::StartNew()
-function Step([string]$name) { Write-Host ("[{0:mm\:ss}] {1}" -f $sw.Elapsed, $name) -ForegroundColor Cyan }
+function Step([string]$name) { Write-Host ("[{0:hh\:mm\:ss}] {1}" -f $sw.Elapsed, $name) -ForegroundColor Cyan }
 
 # 1. SLAM
 if (-not $Map) {
