@@ -121,7 +121,7 @@ def main():
     parser.add_argument('--source', choices=['model', 'stereo'], default='model')
     parser.add_argument('--model', help='Model folder (default DATA/3dgs)')
     parser.add_argument('--output', help='Mesh PLY (default MODEL/mesh.ply, or DATA/stereo_mesh.ply)')
-    parser.add_argument('--voxel', type=float, default=0.01, help='TSDF voxel size (m)')
+    parser.add_argument('--voxel', type=float, default=0.02, help='TSDF voxel size (m)')
     parser.add_argument('--max-depth', type=float, default=4.0, help='Depth truncation (m)')
     parser.add_argument('--depth', choices=['median', 'expected'], default='median', help='2dgs: rendered depth fused')
     parser.add_argument('--min-alpha', type=float, default=0.5, help='Rendered pixels under this opacity are not fused')
@@ -147,6 +147,14 @@ def main():
     images = [im for k, im in enumerate(images) if not (test_every > 0 and k % test_every == 0)]
     load_images(args.data, cameras, images, factor)
     height, width = images[0]['image'].shape[:2]
+    refined = os.path.join(model_dir, 'refined_viewmats.json')
+    if args.source == 'model' and os.path.exists(refined):
+        # Camera poses refined by the training
+        viewmats = json.load(open(refined))
+        for im in images:
+            if im['name'] in viewmats:
+                im['viewmat'] = np.array(viewmats[im['name']])
+        print('Refined camera poses of %s' % refined)
 
     start = time.time()
     if args.source == 'model':

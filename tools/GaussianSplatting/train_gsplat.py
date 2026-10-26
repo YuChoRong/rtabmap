@@ -14,6 +14,10 @@ code, no gsplat example scripts. Dependencies: torch (CUDA), gsplat, numpy, Pill
 - --mode 2dgs trains 2D Gaussians (flat disks, gsplat's rasterization_2dgs) with the
   depth distortion and normal consistency losses of 2DGS (Huang et al. 2024, implemented
   here from the paper): their surfaces give much cleaner meshes (extract_mesh.py).
+- --pose-lr refines the camera pose of each training image (small SE(3) correction
+  from the SLAM pose) and --exposure fits a per-image color gain and offset (auto
+  exposure of the D435i); the refined poses are saved in OUTPUT/refined_viewmats.json
+  and used by extract_mesh.py.
 - When DATA/depths/<image>.png exists (16-bit mm, from rtabmap_to_colmap.py --euroc),
   the rendered depth is also fitted to it (--depth-weight).
 - Every --test-every image is held out: PSNR / SSIM on them are written to
@@ -159,6 +163,18 @@ def ssim(a, b, window=11, sigma=1.5):
     return s.mean()
 
 
+def se3_exp_inverse(xi):
+    """Inverse of exp(xi) for xi [6] = (translation, rotation vector): 4x4, differentiable at 0."""
+    import torch
+    t, w = xi[:3], xi[3:]
+    theta = torch.sqrt((w * w).sum() + 1e-12)
+    zero = torch.zeros((), dtype=xi.dtype, device=xi.device)
+    K = torch.stack([torch.stack([zero, -w[2], w[1]]), torch.stack([w[2], zero, -w[0]]), torch.stack([-w[1], w[0], zero])])
+    R = torch.eye(3, dtype=xi.dtype, device=xi.device) + torch.sin(theta) / theta * K + (1 - torch.cos(theta)) / theta**2 * (K @ K)
+    top = torch.cat([R.T, (-R.T @ t)[:, None]], 1)
+    return torch.cat([top, torch.tensor([[0, 0, 0, 1]], dtype=xi.dtype, device=xi.device)], 0)
+
+
 def knn_distance(points, k=3, chunk=2048):
     """Mean distance to the k nearest neighbors of each point (brute force by chunks, on the GPU)."""
     import torch
@@ -216,11 +232,25 @@ def train(args, cameras, images, xyz, rgb):
            'sh0': 2.5e-3, 'shN': 2.5e-3 / 20}
     optimizers = {k: torch.optim.Adam([{'params': params[k], 'lr': lr, 'name': k}], eps=1e-15)
                   for k, lr in lrs.items()}
+    # Camera pose corrections (camera to world: c2w @ exp(xi)) and per-image color gain / offset
+    pose_deltas = torch.nn.Parameter(torch.zeros(len(trainset), 6, device=device))
+    exposure = torch.nn.Parameter(torch.zeros(len(trainset), 6, device=device))
+    if args.pose_lr > 0:
+        optimizers['pose'] = torch.optim.Adam([pose_deltas], lr=args.pose_lr)
+    if args.exposure:
+        optimizers['exposure'] = torch.optim.Adam([exposure], lr=1e-3)
+    gs_optimizers = {k: v for k, v in optimizers.items() if k in lrs}
+
+    def train_viewmat(k):
+        if args.pose_lr <= 0:
+            return train_viewmats[k:k+1]
+        return (se3_exp_inverse(pose_deltas[k]) @ train_viewmats[k])[None]
+
     # Position learning rate decays to 1% over the training
     means_scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizers['means'], gamma=0.01 ** (1.0 / args.steps))
     strategy = DefaultStrategy(refine_stop_iter=min(15000, args.steps // 2), verbose=False, grow_grad2d=args.grow_grad,
                                key_for_gradient='gradient_2dgs' if two_d else 'means2d')
-    strategy.check_sanity(params, optimizers)
+    strategy.check_sanity(params, gs_optimizers)
     state = strategy.initialize_state(scene_scale=scene_scale)
 
     def render(viewmats, Ks, degree):
@@ -241,8 +271,10 @@ def train(args, cameras, images, xyz, rgb):
         k = torch.randint(len(trainset), (1,)).item()
         gt = train_images[k:k+1].float() / 255.0
         degree = min(step // 1000, sh_degree)
-        image, depth, extras, info = render(train_viewmats[k:k+1], train_Ks[k:k+1], degree)
-        strategy.step_pre_backward(params, optimizers, state, step, info)
+        image, depth, extras, info = render(train_viewmat(k), train_Ks[k:k+1], degree)
+        strategy.step_pre_backward(params, gs_optimizers, state, step, info)
+        if args.exposure:
+            image = image * torch.exp(exposure[k, :3]) + exposure[k, 3:]
         l1 = (image - gt).abs().mean()
         loss = 0.8 * l1 + 0.2 * (1.0 - ssim(image.permute(0, 3, 1, 2), gt.permute(0, 3, 1, 2)))
         if use_depth and train_depths[k] is not None:
@@ -263,7 +295,7 @@ def train(args, cameras, images, xyz, rgb):
             opt.step()
             opt.zero_grad(set_to_none=True)
         means_scheduler.step()
-        strategy.step_post_backward(params, optimizers, state, step, info, packed=False)
+        strategy.step_post_backward(params, gs_optimizers, state, step, info, packed=False)
         if args.max_gaussians > 0 and params['means'].shape[0] > args.max_gaussians and strategy.refine_stop_iter > step:
             # Memory and time grow with the count: stop densifying (and pruning) here
             print('%d Gaussians > --max-gaussians at step %d: densification stopped' % (params['means'].shape[0], step))
@@ -288,6 +320,13 @@ def train(args, cameras, images, xyz, rgb):
                     os.path.join(args.output, 'renders', os.path.splitext(im['name'])[0] + '.png'))
             stats.update(test_images=len(test), psnr=float(np.mean(psnrs)), ssim=float(np.mean(ssims)))
             print('Test images: PSNR %.2f dB, SSIM %.4f' % (stats['psnr'], stats['ssim']))
+        if args.pose_lr > 0:
+            refined = {im['name']: train_viewmat(k)[0].cpu().numpy().tolist() for k, im in enumerate(trainset)}
+            json.dump(refined, open(os.path.join(args.output, 'refined_viewmats.json'), 'w'))
+            d = pose_deltas.detach()
+            stats.update(pose_correction_mean_cm=float(d[:, :3].norm(dim=1).mean() * 100),
+                         pose_correction_mean_deg=float(np.degrees(d[:, 3:].norm(dim=1).mean().item())))
+            print('Pose corrections: %.2f cm, %.2f deg on average' % (stats['pose_correction_mean_cm'], stats['pose_correction_mean_deg']))
         json.dump(stats, open(os.path.join(args.output, 'stats.json'), 'w'), indent=2)
         q = torch.nn.functional.normalize(params['quats'], dim=-1)
         save_ply(os.path.join(args.output, 'point_cloud.ply'), params['means'].cpu().numpy(),
@@ -311,6 +350,8 @@ def main():
     parser.add_argument('--normal-from', type=int, default=7000, help='2dgs: step where the normal loss starts')
     parser.add_argument('--dist-weight', type=float, default=0.01, help='2dgs: depth distortion weight')
     parser.add_argument('--dist-from', type=int, default=3000, help='2dgs: step where the distortion loss starts')
+    parser.add_argument('--pose-lr', type=float, default=2e-5, help='Learning rate of the camera pose corrections (0 = SLAM poses as they are)')
+    parser.add_argument('--exposure', type=int, default=1, help='Fit a color gain and offset per training image (1) or not (0)')
     parser.add_argument('--grow-grad', type=float, default=0.0002, help='Densification threshold of the 2D position gradient (higher = fewer Gaussians)')
     parser.add_argument('--max-gaussians', type=int, default=3000000, help='Densification stops above this count (0 = no limit)')
     parser.add_argument('--test-every', type=int, default=8, help='Hold out every Nth image for evaluation (0 = none)')
