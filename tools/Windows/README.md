@@ -8,13 +8,31 @@ driver and the GUI (`-NoGui` for the command-line tools only).
    (python.org, "Add python.exe to PATH"), and the NVIDIA driver.
 2. In cmd.exe:
    ```
-   git clone -b claude/project-thread-vev8qn https://github.com/yuchorong/rtabmap C:\slam\src
+   git clone -b claude/project-thread-rwmhjg https://github.com/yuchorong/rtabmap C:\slam\src
    C:\slam\src\tools\Windows\build_windows.bat -Root C:\slam
    ```
    The PyTorch CUDA build is chosen from `nvidia-smi` (`-Cuda cu126` etc. to force it,
    `-Cuda cpu` without NVIDIA GPU). The first run builds OpenCV, PCL, Qt, VTK, GTSAM and
    librealsense with vcpkg (2-3 hours); running it again only rebuilds RTAB-Map.
    It ends by printing the RTAB-Map version and the GPU seen by PyTorch.
+
+   A build folder (`-Root\build`) belongs to one source folder: to build another copy of
+   the sources (e.g. an unzipped download) with the same `-Root`, delete `-Root\build`
+   first (vcpkg and the venv are reused), or use another `-Root`. An Anaconda/Miniconda in
+   the PATH is ignored, so that all libraries come from vcpkg.
+
+## Portable package (another PC without building)
+
+```
+C:\slam\src\tools\Windows\make_portable.bat -Root C:\slam -Out D:\rtabmap_portable
+```
+makes `D:\rtabmap_portable` and `D:\rtabmap_portable.zip` (~6.5 GB, ~3 GB zipped, mostly
+PyTorch with CUDA): RTAB-Map, all its DLLs, the MSVC runtime, Python with the venv packages
+and the ALIKED/LightGlue weights. On the other PC (Windows 10/11 x64), unzip to a short path
+(e.g. `C:\rtabmap`) and run `live_viewer.bat` (`cmd.bat`: a command prompt with
+`rtabmap-*.exe` and `python`). Only an NVIDIA driver is needed for ALIKED + LightGlue on the
+GPU; ORB works on any PC. `-NoZip` skips the zip. The script checks the package with a
+clean PATH before zipping it.
 
 ## Live D435i
 
@@ -33,6 +51,30 @@ in Preferences (Advanced mode), set the source:
 
 Hold the camera still for 1-2 s at the start, or move it smoothly (dynamic
 initialization). Odometry and loop closure times are in the Statistics panel.
+
+## Live viewer (mapping, localization, map viewing)
+
+```
+C:\slam\src\tools\Windows\live_viewer.bat [--open MAP.db]
+```
+`rtabmap-live_viewer.exe` (tools/LiveViewer, built with RTAB-Map; Qt window with RTAB-Map's 3D
+view), run with the environment of `rtabmap_env.bat`:
+- **1. 실시간 매핑**: D435i (IR stereo, emitter off, + IMU; nothing to set in Preferences) or a
+  recording replayed in real time (`.bag`/`.db3`, converted once next to it, or a EuRoC
+  folder) -> VIO + SLAM. Point cloud map, keyframe graph, loop closures, camera pose and
+  image are shown as they are built; the map is saved as `map_<date>.db` in the chosen folder
+  when stopped (or when the recording ends).
+- **2. 실시간 로컬라이제이션**: shows a saved map, then localizes the live camera in it (the map
+  file is not modified): current pose, live path, map matches in green. The features (ORB or
+  ALIKED + LightGlue) follow the map.
+- **파일 > 맵 불러오기**: any RTAB-Map `.db`, offline, with the stereo point clouds;
+  **파일 > 녹화 파일 열기**: a recording to replay.
+- When a task ends (recording finished, camera stopped, map saved or opened) the viewer goes back
+  to standby ("대기 중") and waits for the next one (live camera, recording or map). It closes only
+  when the user quits (파일 > 종료 or the window's close button).
+
+`--auto map|loc|view --source realsense|REC --db OUT_DIR_OR_MAP [--screenshot out.png] [--exit]` starts
+one module at startup, then waits in standby; `--exit` closes the viewer at the end (unattended tests).
 
 ## Recordings
 

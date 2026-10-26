@@ -77,6 +77,14 @@ public:
 	void setResolution(int width, int height, int fps = 30);
 	void setDepthResolution(int width, int height, int fps = 30);
 	void setGlobalTimeSync(bool enabled);
+	/**
+	 * With setIRFormat(true, false) (left/right IR as stereo): also stream the color camera.
+	 * The color frame closest in time to each stereo frame is attached as user data,
+	 * JPEG encoded (1 x N CV_8SC1, as a CV_8UC1 row would be taken as already compressed). Its calibration is colorModel() after init().
+	 */
+	void setColorWithIR(bool enabled, int width = 640, int height = 480);
+	/** Calibration of the color camera of setColorWithIR(), local transform from the base frame. */
+	const CameraModel & colorModel() const;
 
 	/**
 	 * Dual mode (D400+T265 or L500+T265)
@@ -129,6 +137,13 @@ private:
 	bool imuGlobalSyncWarningShown_;
 
 	bool emitterEnabled_;
+	bool colorWithIR_;
+	int colorWidth_;
+	int colorHeight_;
+	CameraModel colorModel_;
+	UMutex colorMutex_;
+	cv::Mat lastColor_;
+	double lastColorStamp_;
 	bool ir_;
 	bool irDepth_;
 	bool rectifyImages_;
