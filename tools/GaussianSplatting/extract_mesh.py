@@ -7,7 +7,7 @@
 
 DATA is a COLMAP folder made by rtabmap_to_colmap.py (sparse/0, images/, depths/).
 With a model, the depth and color of every training image are rendered with gsplat
-(median depth for 2dgs models, expected depth for 3dgs models, pixels with an
+(median depth for 2dgs models by default, expected depth for 3dgs models, pixels with an
 opacity under --min-alpha are left out) and fused in an Open3D TSDF volume; the mesh
 is the zero level set (marching cubes). Small disconnected pieces are removed.
 The images held out by train_gsplat.py (--test-every) are not fused, so
@@ -48,7 +48,7 @@ def read_gaussians(path):
                 scales=pick('scale_'), quats=pick('rot_'))
 
 
-def render_views(model_dir, images, width, height, min_alpha):
+def render_views(model_dir, images, width, height, min_alpha, depth_mode):
     """Yields (image index, rgb uint8 [H, W, 3], depth float32 [H, W]) rendered from the model."""
     import torch
     from gsplat import rasterization, rasterization_2dgs
@@ -67,7 +67,7 @@ def render_views(model_dir, images, width, height, min_alpha):
                  torch.sigmoid(t['opacities']), colors, viewmat, K, width, height)
             if meta['mode'] == '2dgs':
                 out, alphas, _, _, _, median, _ = rasterization_2dgs(*a, sh_degree=degree, packed=False, render_mode='RGB+ED')
-                depth = median[0, ..., 0]
+                depth = median[0, ..., 0] if depth_mode == 'median' else out[0, ..., 3]
             else:
                 out, alphas, _ = rasterization(*a, sh_degree=degree, packed=False, render_mode='RGB+ED')
                 depth = out[0, ..., 3]
@@ -121,6 +121,7 @@ def main():
     parser.add_argument('--output', help='Mesh PLY (default MODEL/mesh.ply, or DATA/stereo_mesh.ply)')
     parser.add_argument('--voxel', type=float, default=0.01, help='TSDF voxel size (m)')
     parser.add_argument('--max-depth', type=float, default=4.0, help='Depth truncation (m)')
+    parser.add_argument('--depth', choices=['median', 'expected'], default='median', help='2dgs: rendered depth fused')
     parser.add_argument('--min-alpha', type=float, default=0.5, help='Rendered pixels under this opacity are not fused')
     parser.add_argument('--factor', type=int, default=0, help='Image downscale factor (default: the model\'s, else 1)')
     parser.add_argument('--test-every', type=int, default=-1, help='Held-out images not fused (default: the model\'s, else 8)')
@@ -147,7 +148,7 @@ def main():
 
     start = time.time()
     if args.source == 'model':
-        views = render_views(model_dir, images, width, height, args.min_alpha)
+        views = render_views(model_dir, images, width, height, args.min_alpha, args.depth)
     else:
         if not any(im['depth'] is not None for im in images):
             sys.exit('No depth map in %s/depths (export with rtabmap_to_colmap.py --euroc)' % args.data)
