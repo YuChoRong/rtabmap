@@ -18,7 +18,9 @@ object edges). The surface is cut where it is farther than --poisson-trim from t
 points, so only holes up to about twice that size are filled.
 With --method hybrid (default for models), the TSDF mesh is kept as it is and only
 the parts of the Poisson surface farther than --hybrid-gap from it (the holes) are
-added: the accuracy of TSDF with the coverage of Poisson.
+added: the accuracy of TSDF with the coverage of Poisson. Small holes of the TSDF
+mesh (boundary loops under --fill-holes, e.g. specks on a shiny floor) are first
+closed directly.
 The images held out by train_gsplat.py (--test-every) are not fused, so
 eval_mesh.py can check the mesh on them.
 
@@ -160,9 +162,13 @@ def poisson(views, images, voxel, max_depth, trim, depth_level):
     return mesh, count
 
 
-def hybrid(tsdf, filler, gap):
+def hybrid(tsdf, filler, gap, hole_size):
     """TSDF mesh plus the triangles of the Poisson surface that lie in its holes."""
     import open3d as o3d
+    if hole_size > 0:
+        n = len(tsdf.triangles)
+        tsdf = o3d.t.geometry.TriangleMesh.from_legacy(tsdf).fill_holes(hole_size=hole_size).to_legacy()
+        print('%d triangles close the small holes of the TSDF mesh' % (len(tsdf.triangles) - n))
     scene = o3d.t.geometry.RaycastingScene()
     scene.add_triangles(o3d.t.geometry.TriangleMesh.from_legacy(tsdf))
     vertices = np.asarray(filler.vertices, np.float32)
@@ -193,7 +199,9 @@ def main():
     parser.add_argument('--poisson-depth', type=int, default=9, help='Octree depth of the Poisson surface (9: about 2 cm cells in a 10 m scene)')
     parser.add_argument('--poisson-trim', type=float, default=0.03,
                         help='Poisson surface farther than this from the depth points is removed (m)')
-    parser.add_argument('--hybrid-gap', type=float, default=0.03,
+    parser.add_argument('--fill-holes', type=float, default=0.1,
+                        help='hybrid: holes of the TSDF mesh smaller than this are closed first (m, 0 = off)')
+    parser.add_argument('--hybrid-gap', type=float, default=0.02,
                         help='hybrid: Poisson triangles farther than this from the TSDF mesh fill its holes (m)')
     parser.add_argument('--model', help='Model folder (default DATA/3dgs)')
     parser.add_argument('--output', help='Mesh PLY (default MODEL/mesh.ply, or DATA/stereo_mesh.ply)')
@@ -246,7 +254,7 @@ def main():
         mesh, count = poisson(views, images, args.voxel, args.max_depth, args.poisson_trim, args.poisson_depth)
     if args.method != 'poisson':
         tsdf, count = fuse(views, images, args.voxel, args.max_depth, args.device, args.min_weight)
-        mesh = hybrid(clean(tsdf, args.min_triangles), mesh, args.hybrid_gap) if args.method == 'hybrid' else tsdf
+        mesh = hybrid(clean(tsdf, args.min_triangles), mesh, args.hybrid_gap, args.fill_holes) if args.method == 'hybrid' else tsdf
     raw = len(mesh.triangles)
     mesh = clean(mesh, args.min_triangles)
     import open3d as o3d
