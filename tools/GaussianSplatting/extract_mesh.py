@@ -162,19 +162,27 @@ def poisson(views, images, voxel, max_depth, trim, depth_level):
     return mesh, count
 
 
-def hybrid(tsdf, filler, gap, hole_size):
+def hybrid(tsdf, filler, gap, hole_size, grow):
     """TSDF mesh plus the triangles of the Poisson surface that lie in its holes."""
     import open3d as o3d
     if hole_size > 0:
         n = len(tsdf.triangles)
-        tsdf = o3d.t.geometry.TriangleMesh.from_legacy(tsdf).fill_holes(hole_size=hole_size).to_legacy()
+        # Keep the tensor mesh in a variable: chained on the temporary, fill_holes crashes (Open3D 0.20, Windows)
+        tensor_mesh = o3d.t.geometry.TriangleMesh.from_legacy(tsdf)
+        tsdf = tensor_mesh.fill_holes(hole_size=hole_size).to_legacy()
         print('%d triangles close the small holes of the TSDF mesh' % (len(tsdf.triangles) - n))
     scene = o3d.t.geometry.RaycastingScene()
     scene.add_triangles(o3d.t.geometry.TriangleMesh.from_legacy(tsdf))
     vertices = np.asarray(filler.vertices, np.float32)
     far = scene.compute_distance(o3d.core.Tensor(vertices)).numpy() > gap
     triangles = np.asarray(filler.triangles)
-    filler.remove_triangles_by_mask(~far[triangles].any(1))   # keep the triangles touching a hole
+    keep = far[triangles].any(1)   # the triangles touching a hole
+    for _ in range(grow):
+        # Grown by rings of triangles over the TSDF border, else a strip up to gap wide stays open
+        touched = np.zeros(len(vertices), bool)
+        touched[triangles[keep].ravel()] = True
+        keep = touched[triangles].any(1)
+    filler.remove_triangles_by_mask(~keep)
     filler.remove_unreferenced_vertices()
     print('%d triangles added in the holes of the TSDF mesh' % len(filler.triangles))
     return tsdf + filler
@@ -199,10 +207,12 @@ def main():
     parser.add_argument('--poisson-depth', type=int, default=9, help='Octree depth of the Poisson surface (9: about 2 cm cells in a 10 m scene)')
     parser.add_argument('--poisson-trim', type=float, default=0.03,
                         help='Poisson surface farther than this from the depth points is removed (m)')
-    parser.add_argument('--fill-holes', type=float, default=0.1,
+    parser.add_argument('--fill-holes', type=float, default=0.2,
                         help='hybrid: holes of the TSDF mesh smaller than this are closed first (m, 0 = off)')
     parser.add_argument('--hybrid-gap', type=float, default=0.02,
                         help='hybrid: Poisson triangles farther than this from the TSDF mesh fill its holes (m)')
+    parser.add_argument('--hybrid-grow', type=int, default=2,
+                        help='hybrid: rings of Poisson triangles added around each hole, to close the seams')
     parser.add_argument('--model', help='Model folder (default DATA/3dgs)')
     parser.add_argument('--output', help='Mesh PLY (default MODEL/mesh.ply, or DATA/stereo_mesh.ply)')
     parser.add_argument('--voxel', type=float, default=0.02, help='TSDF voxel size (m)')
@@ -254,7 +264,7 @@ def main():
         mesh, count = poisson(views, images, args.voxel, args.max_depth, args.poisson_trim, args.poisson_depth)
     if args.method != 'poisson':
         tsdf, count = fuse(views, images, args.voxel, args.max_depth, args.device, args.min_weight)
-        mesh = hybrid(clean(tsdf, args.min_triangles), mesh, args.hybrid_gap, args.fill_holes) if args.method == 'hybrid' else tsdf
+        mesh = hybrid(clean(tsdf, args.min_triangles), mesh, args.hybrid_gap, args.fill_holes, args.hybrid_grow) if args.method == 'hybrid' else tsdf
     raw = len(mesh.triangles)
     mesh = clean(mesh, args.min_triangles)
     import open3d as o3d
