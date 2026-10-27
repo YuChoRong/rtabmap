@@ -163,8 +163,9 @@ $meshes = @((Join-Path $model "mesh.ply"), (Join-Path $model "mesh_hybrid.ply"),
 if (Test-Path $poisson) { $meshes += $poisson }
 Run-Python (@((Join-Path $PSScriptRoot "eval_mesh.py"), $colmap) + $meshes + @("--json", (Join-Path $Out "mesh_eval.json")))
 
-# 7. Model for viewing: best render quality of the 20261027 tests (aligned PSNR 27.6 dB vs 26.0 dB
-#    for 3DGS on the keyframes only, same time); full resolution did not add detail there
+# 7. Model for viewing: best render quality of the 20261027 tests (aligned PSNR 28.9 dB vs 26.0 dB
+#    for 3DGS on the keyframes only, same time; stronger pose refinement removed ghost edges);
+#    full resolution did not add detail there
 if (-not $NoRender) {
     $colmapX = Join-Path $Out "colmap_x8"
     $render = Join-Path $colmapX "3dgs"
@@ -176,7 +177,7 @@ if (-not $NoRender) {
     if (-not (Test-Path (Join-Path $render "point_cloud.ply"))) {
         Step "7/7 3DGS training for viewing ($Steps steps, MCMC)"
         Run-Python @((Join-Path $PSScriptRoot "train_gsplat.py"), $colmapX, "--output", $render, "--mode", "3dgs", "--strategy", "mcmc",
-                     "--min-sharpness", "0.5", "--steps", "$Steps", "--factor", "$Factor", "--max-gaussians", "$MaxGaussians")
+                     "--min-sharpness", "0.5", "--pose-lr", "1e-4", "--steps", "$Steps", "--factor", "$Factor", "--max-gaussians", "$MaxGaussians")
     }
 }
 Step "Done: $(Join-Path $model 'mesh_hybrid.ply')$(if (-not $NoRender) { ', ' + (Join-Path $Out 'colmap_x8\3dgs\point_cloud.ply') })"

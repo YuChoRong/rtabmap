@@ -457,7 +457,7 @@ def main():
     parser.add_argument('--dist-from', type=int, default=3000, help='2dgs: step where the distortion loss starts')
     parser.add_argument('--pose-lr', type=float, default=2e-5, help='Learning rate of the camera pose corrections (0 = SLAM poses as they are)')
     parser.add_argument('--exposure', type=int, default=1, help='Fit a color gain and offset per training image (1) or not (0)')
-    parser.add_argument('--test-align-steps', type=int, default=200, help='With --pose-lr: steps fitting the pose and exposure of each held-out image before evaluation')
+    parser.add_argument('--test-align-steps', type=int, default=500, help='With --pose-lr: steps fitting the pose and exposure of each held-out image before evaluation')
     parser.add_argument('--grow-grad', type=float, default=0.0002, help='Densification threshold of the 2D position gradient (higher = fewer Gaussians)')
     parser.add_argument('--max-gaussians', type=int, default=3000000, help='Densification stops above this count (0 = no limit)')
     parser.add_argument('--strategy', choices=['default', 'mcmc'], default='default',
