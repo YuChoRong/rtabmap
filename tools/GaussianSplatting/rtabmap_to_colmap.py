@@ -21,7 +21,8 @@ images are exported instead of the infrared ones, and depth maps are added:
                                 keyframe pose interpolated at the color stamp, moved to
                                 the color camera with the T_BS extrinsics of sensor.yaml
   OUT/depths/<id>.png           16-bit depth (mm) in the color camera, from the infrared
-                                stereo pair of the keyframe (OpenCV SGBM), 0 = unknown
+                                stereo pair of the keyframe (OpenCV SGBM), 0 = unknown; from the
+                                nearest pair with the emitter on when mav0/cam0_emitter exists
   OUT/sparse/0/points3D.txt     colored points back-projected from the depth maps
 
 Usage: rtabmap_to_colmap.py map.db OUT [--euroc DIR] [--rtabmap-export PATH] [--voxel 0.02] [--max-points 200000]
@@ -228,8 +229,14 @@ def export_euroc_color(args, cameras, out_images, out_depths):
     if not os.path.isdir(os.path.join(mav, 'rgb')):
         sys.exit('No color stream in %s (convert the recording with realsense_bag_to_euroc.py --rgb)' % mav)
     K_rgb, size_rgb, T_b_rgb, rgb_frames = read_euroc_camera(os.path.join(mav, 'rgb'))
-    K_ir, _, T_b_c0, left_frames = read_euroc_camera(os.path.join(mav, 'cam0'))
-    _, _, T_b_c1, right_frames = read_euroc_camera(os.path.join(mav, 'cam1'))
+    # Emitter On Off recordings (realsense_bag_to_euroc.py --emitter-split): depth from the
+    # frames with the dot pattern, which are not the keyframes' frames
+    emitter = os.path.isdir(os.path.join(mav, 'cam0_emitter'))
+    suffix = '_emitter' if emitter else ''
+    K_ir, _, T_b_c0, left_frames = read_euroc_camera(os.path.join(mav, 'cam0' + suffix))
+    _, _, T_b_c1, right_frames = read_euroc_camera(os.path.join(mav, 'cam1' + suffix))
+    if emitter:
+        print('Depth from the infrared frames with the emitter on (cam0_emitter, cam1_emitter)')
     baseline = float(np.linalg.norm((np.linalg.inv(T_b_c0) @ T_b_c1)[:3, 3]))
     T_c0_rgb = np.linalg.inv(T_b_c0) @ T_b_rgb
 
@@ -261,14 +268,14 @@ def export_euroc_color(args, cameras, out_images, out_depths):
         # Depth of the keyframe's infrared pair, moved to the color camera at the color stamp
         li = int(np.argmin(np.abs(left_stamps - stamp)))
         right_path = right_by_stamp.get(round(left_stamps[li], 4))
-        if abs(left_stamps[li] - stamp) > 0.002 or right_path is None:
+        if abs(left_stamps[li] - stamp) > (0.04 if emitter else 0.002) or right_path is None:
             continue
         left = cv2.imread(left_frames[li][1], cv2.IMREAD_GRAYSCALE)
         right = cv2.imread(right_path, cv2.IMREAD_GRAYSCALE)
         if left is None or right is None:
             continue
         depth_ir = stereo_depth(left, right, K_ir[0, 0], baseline, args.max_depth)
-        T_rgb_ir = np.linalg.inv(T_w_rgb) @ kf_poses[k]
+        T_rgb_ir = np.linalg.inv(T_w_rgb) @ interpolate_pose(kf_stamps, kf_poses, left_stamps[li])
         depth = project_depth(depth_ir, K_ir, T_rgb_ir, K_rgb, size_rgb)
         cv2.imwrite(os.path.join(out_depths, '%d.png' % i), np.round(depth * 1000).astype(np.uint16))
 
