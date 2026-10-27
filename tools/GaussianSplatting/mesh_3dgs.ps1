@@ -2,6 +2,8 @@
 #
 # usage (PowerShell):
 #   .\mesh_3dgs.ps1 -Euroc C:\slam\data\20261013_105416\euroc_rgb [-Out C:\slam\out\mesh_20261013] [-Map map.db]
+#   .\mesh_3dgs.ps1 -Bag C:\slam\data\rec.bag [-EmitterSplit]   (converted first to OUT\euroc_rgb;
+#     -EmitterSplit for "Emitter On Off" recordings, see tools\RealSense\README.md)
 # or from cmd.exe: mesh_3dgs.bat -Euroc C:\slam\data\20261013_105416\euroc_rgb
 #
 # Steps (each one is skipped when its result already exists, delete the file to redo it):
@@ -13,7 +15,10 @@
 #      RTAB-Map's Poisson mesh (OUT\poisson_mesh.ply)
 #   6. eval_mesh.py on the held-out images                            -> OUT\mesh_eval.json
 param(
-    [Parameter(Mandatory = $true)][string]$Euroc,
+    [string]$Euroc = "",
+    [string]$Bag = "",
+    [switch]$EmitterSplit,
+    [string]$ConvertPython = "C:\slam\venv\Scripts\python.exe",
     [string]$Out = "",
     [string]$Map = "",
     [string]$Install = "C:\slam\install",
@@ -27,7 +32,11 @@ param(
 $ErrorActionPreference = "Stop"
 # PowerShell 5: $PSScriptRoot is empty in param() defaults
 if (-not $Venv) { $Venv = Join-Path $PSScriptRoot ".gs_env" }
-if (-not $Out) { $Out = Join-Path "C:\slam\out" ("mesh_" + (Split-Path (Split-Path $Euroc -Parent) -Leaf)) }
+if (-not $Euroc -and -not $Bag) { throw "Give -Euroc (converted recording) or -Bag (RealSense Viewer recording)" }
+if (-not $Out) {
+    $name = if ($Bag) { [IO.Path]::GetFileNameWithoutExtension($Bag) } else { Split-Path (Split-Path $Euroc -Parent) -Leaf }
+    $Out = Join-Path "C:\slam\out" ("mesh_" + $name)
+}
 New-Item -ItemType Directory -Force $Out | Out-Null
 $colmap = Join-Path $Out "colmap"
 $model = Join-Path $colmap "2dgs"
@@ -65,6 +74,21 @@ function Run-Python([string[]]$arguments, [switch]$WithRtabmap) {
 
 $sw = [Diagnostics.Stopwatch]::StartNew()
 function Step([string]$name) { Write-Host ("[{0:hh\:mm\:ss}] {1}" -f $sw.Elapsed, $name) -ForegroundColor Cyan }
+
+# 0. Conversion of the recording (python of rtabmap_env.bat's environment, with rosbags)
+if ($Bag) {
+    $Euroc = Join-Path $Out "euroc_rgb"
+    if (-not (Test-Path (Join-Path $Euroc "mav0\cam0\data.csv"))) {
+        Step "0/6 Convert $Bag -> $Euroc"
+        $a = @((Join-Path $PSScriptRoot "..\RealSense\realsense_bag_to_euroc.py"), $Bag, $Euroc, "--rgb")
+        if ($EmitterSplit) { $a += "--emitter-split" }
+        $ErrorActionPreference = "Continue"
+        & $ConvertPython @a
+        $code = $LASTEXITCODE
+        $ErrorActionPreference = "Stop"
+        if ($code -ne 0) { throw "Conversion failed ($code)" }
+    }
+}
 
 # 1. SLAM
 if (-not $Map) {
