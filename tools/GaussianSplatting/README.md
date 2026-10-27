@@ -118,7 +118,8 @@ mesh_3dgs.bat -Euroc C:\slam\data\20261013_105416\euroc_rgb
 
 Results in `C:\slam\out\mesh_20261013_105416` (`-Out` to change it):
 `colmap\2dgs\mesh.ply` (the mesh, vertex colors), `colmap\stereo_mesh.ply` and
-`poisson_mesh.ply` (baselines), `mesh_eval.json`. Each step is skipped when its
+`poisson_mesh.ply` (baselines), `mesh_eval.json`. A 3DGS model for viewing is also trained
+(`colmap_x8\3dgs\point_cloud.ply`: extra color images, MCMC strategy; `-NoRender` skips it). Each step is skipped when its
 result exists, so a run can be resumed. The steps, also usable alone (Linux too):
 
 ```bash

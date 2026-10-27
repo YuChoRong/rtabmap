@@ -1,4 +1,4 @@
-# Mesh of a recording with 2D Gaussian Splatting, on Windows (NVIDIA GPU).
+# Mesh (2D Gaussian Splatting) and 3DGS model of a recording, on Windows (NVIDIA GPU).
 #
 # usage (PowerShell):
 #   .\mesh_3dgs.ps1 -Euroc C:\slam\data\20261013_105416\euroc_rgb [-Out C:\slam\out\mesh_20261013] [-Map map.db]
@@ -15,6 +15,9 @@
 #   5. Baselines: TSDF of the stereo depth (OUT\colmap\stereo_mesh.ply) and
 #      RTAB-Map's Poisson mesh (OUT\poisson_mesh.ply)
 #   6. eval_mesh.py on the held-out images                            -> OUT\mesh_eval.json
+#   7. Model for viewing (skipped with -NoRender): export with extra color images between
+#      the keyframes (-ExtraRate per second) and 3DGS training with the MCMC strategy,
+#      blurred images left out                                         -> OUT\colmap_x8\3dgs
 param(
     [string]$Euroc = "",
     [string]$Bag = "",
@@ -28,6 +31,8 @@ param(
     [int]$Steps = 30000,
     [int]$MaxGaussians = 1500000,   # more did not improve the mesh (20261027 recording), only the time
     [int]$Factor = 2,          # half resolution: 3x faster than 1, mesh as good (20261027 emitter recording)
+    [switch]$NoRender,
+    [double]$ExtraRate = 8,
     [string]$Cuda = "cu124",
     [string]$Venv = ""
 )
@@ -83,7 +88,7 @@ function Step([string]$name) { Write-Host ("[{0:hh\:mm\:ss}] {1}" -f $sw.Elapsed
 if ($Bag) {
     $Euroc = Join-Path $Out "euroc_rgb"
     if (-not (Test-Path (Join-Path $Euroc "mav0\cam0\data.csv"))) {
-        Step "0/6 Convert $Bag -> $Euroc"
+        Step "0/7 Convert $Bag -> $Euroc"
         $a = @((Join-Path $PSScriptRoot "..\RealSense\realsense_bag_to_euroc.py"), $Bag, $Euroc, "--rgb")
         if ($EmitterSplit) { $a += "--emitter-split" }
         $ErrorActionPreference = "Continue"
@@ -98,7 +103,7 @@ if ($Bag) {
 if (-not $Map) {
     $Map = Join-Path $Out "map.db"
     if (-not (Test-Path $Map)) {
-        Step "1/6 SLAM ($DetectionRate keyframes/s) -> $Map"
+        Step "1/7 SLAM ($DetectionRate keyframes/s) -> $Map"
         $a = $SlamArgs.Split(" ", [StringSplitOptions]::RemoveEmptyEntries) + @("--Rtabmap/DetectionRate", "$DetectionRate", "--output", $Out, "--output_name", "map", $Euroc)
         Run-Rtabmap "rtabmap-euroc_dataset.exe" $a (Join-Path $Out "slam.log")
     }
@@ -119,42 +124,59 @@ if (-not $ready) {
 
 # 2. Export
 if (-not (Test-Path (Join-Path $colmap "sparse\0\images.txt"))) {
-    Step "2/6 Export color images, poses and stereo depth -> $colmap"
+    Step "2/7 Export color images, poses and stereo depth -> $colmap"
     Run-Python @((Join-Path $PSScriptRoot "rtabmap_to_colmap.py"), $Map, $colmap, "--euroc", $Euroc,
                  "--rtabmap-export", (Join-Path $Install "bin\rtabmap-export.exe")) -WithRtabmap
 }
 
 # 3. Training
 if (-not (Test-Path (Join-Path $model "point_cloud.ply"))) {
-    Step "3/6 2DGS training ($Steps steps)"
+    Step "3/7 2DGS training ($Steps steps)"
     Run-Python @((Join-Path $PSScriptRoot "train_gsplat.py"), $colmap, "--output", $model, "--mode", "2dgs",
                  "--steps", "$Steps", "--factor", "$Factor", "--max-gaussians", "$MaxGaussians")
 }
 
 # 4. Mesh
 if (-not (Test-Path (Join-Path $model "mesh.ply"))) {
-    Step "4/6 Mesh of the 2DGS model"
+    Step "4/7 Mesh of the 2DGS model"
     Run-Python @((Join-Path $PSScriptRoot "extract_mesh.py"), $colmap, "--model", $model)
 }
 if (-not (Test-Path (Join-Path $model "mesh_hybrid.ply"))) {
-    Step "4/6 Mesh of the 2DGS model, holes of the TSDF mesh filled by a Poisson surface"
+    Step "4/7 Mesh of the 2DGS model, holes of the TSDF mesh filled by a Poisson surface"
     Run-Python @((Join-Path $PSScriptRoot "extract_mesh.py"), $colmap, "--model", $model, "--method", "hybrid")
 }
 
 # 5. Baselines
 if (-not (Test-Path (Join-Path $colmap "stereo_mesh.ply"))) {
-    Step "5/6 Baseline: TSDF of the stereo depth"
+    Step "5/7 Baseline: TSDF of the stereo depth"
     Run-Python @((Join-Path $PSScriptRoot "extract_mesh.py"), $colmap, "--source", "stereo", "--factor", "$Factor")
 }
 $poisson = Join-Path $Out "poisson_mesh.ply"
 if (-not (Test-Path $poisson)) {
-    Step "5/6 Baseline: RTAB-Map Poisson mesh"
+    Step "5/7 Baseline: RTAB-Map Poisson mesh"
     Run-Rtabmap "rtabmap-export.exe" @("--mesh", "--output", "poisson", "--output_dir", $Out, $Map) (Join-Path $Out "poisson.log")
 }
 
 # 6. Evaluation
-Step "6/6 Comparison on the held-out images"
+Step "6/7 Comparison on the held-out images"
 $meshes = @((Join-Path $model "mesh.ply"), (Join-Path $model "mesh_hybrid.ply"), (Join-Path $colmap "stereo_mesh.ply"))
 if (Test-Path $poisson) { $meshes += $poisson }
 Run-Python (@((Join-Path $PSScriptRoot "eval_mesh.py"), $colmap) + $meshes + @("--json", (Join-Path $Out "mesh_eval.json")))
-Step "Done: $(Join-Path $model 'mesh.ply')"
+
+# 7. Model for viewing: best render quality of the 20261027 tests (aligned PSNR 27.6 dB vs 26.0 dB
+#    for 3DGS on the keyframes only, same time); full resolution did not add detail there
+if (-not $NoRender) {
+    $colmapX = Join-Path $Out "colmap_x8"
+    $render = Join-Path $colmapX "3dgs"
+    if (-not (Test-Path (Join-Path $colmapX "sparse\0\images.txt"))) {
+        Step "7/7 Export with $ExtraRate extra color images per second -> $colmapX"
+        Run-Python @((Join-Path $PSScriptRoot "rtabmap_to_colmap.py"), $Map, $colmapX, "--euroc", $Euroc, "--extra-rate", "$ExtraRate",
+                     "--rtabmap-export", (Join-Path $Install "bin\rtabmap-export.exe")) -WithRtabmap
+    }
+    if (-not (Test-Path (Join-Path $render "point_cloud.ply"))) {
+        Step "7/7 3DGS training for viewing ($Steps steps, MCMC)"
+        Run-Python @((Join-Path $PSScriptRoot "train_gsplat.py"), $colmapX, "--output", $render, "--mode", "3dgs", "--strategy", "mcmc",
+                     "--min-sharpness", "0.5", "--steps", "$Steps", "--factor", "$Factor", "--max-gaussians", "$MaxGaussians")
+    }
+}
+Step "Done: $(Join-Path $model 'mesh_hybrid.ply')$(if (-not $NoRender) { ', ' + (Join-Path $Out 'colmap_x8\3dgs\point_cloud.ply') })"
