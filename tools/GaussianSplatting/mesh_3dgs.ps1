@@ -25,7 +25,7 @@ param(
     [double]$DetectionRate = 4,
     [string]$SlamArgs = "--Odom/Strategy 15 --OdomVIO/TimeOffset -0.037 --Rtabmap/ImagesAlreadyRectified true",
     [int]$Steps = 30000,
-    [int]$Factor = 1,
+    [int]$Factor = 2,          # half resolution: 3x faster than 1, mesh as good (20261027 emitter recording)
     [string]$Cuda = "cu124",
     [string]$Venv = ""
 )
