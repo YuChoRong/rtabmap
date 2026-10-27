@@ -303,23 +303,54 @@ def train(args, cameras, images, xyz, rgb):
         if step % 500 == 0 or step == args.steps - 1:
             print('step %d/%d loss %.4f, %d Gaussians, %.0f s' % (step, args.steps, loss.item(), params['means'].shape[0], time.time() - start))
 
+    def align_test(viewmat, K, gt):
+        """Pose (and color gain / offset) of a held-out image fitted to the frozen model: the training
+        poses were refined, so the SLAM pose of a test image no longer matches the model exactly."""
+        xi = torch.zeros(6, device=device, requires_grad=True)
+        expo = torch.zeros(6, device=device, requires_grad=True)
+        opt = torch.optim.Adam([{'params': [xi], 'lr': 1e-3}, {'params': [expo], 'lr': 1e-2}])
+        for _ in range(args.test_align_steps):
+            image, _, _, _ = render((se3_exp_inverse(xi) @ viewmat[0])[None], K, sh_degree)
+            loss = ((image * torch.exp(expo[:3]) + expo[3:]) - gt).abs().mean()
+            opt.zero_grad(set_to_none=True)
+            loss.backward()
+            opt.step()
+        for v in params.values():
+            v.grad = None
+        with torch.no_grad():
+            return (se3_exp_inverse(xi) @ viewmat[0])[None], expo.detach().clone()
+
     os.makedirs(args.output, exist_ok=True)
+    aligned = {}
+    if test and args.pose_lr > 0 and args.test_align_steps > 0:
+        test_images, test_viewmats, test_Ks = to_gpu(test)
+        for k in range(len(test)):
+            aligned[k] = align_test(test_viewmats[k:k+1], test_Ks[k:k+1], test_images[k:k+1].float() / 255.0)
     with torch.no_grad():
         stats = {'mode': args.mode, 'steps': args.steps, 'gaussians': int(params['means'].shape[0]), 'train_seconds': time.time() - start}
         if test:
             test_images, test_viewmats, test_Ks = to_gpu(test)
             os.makedirs(os.path.join(args.output, 'renders'), exist_ok=True)
-            psnrs, ssims = [], []
+            psnrs, ssims, psnrs_a, ssims_a = [], [], [], []
             for k, im in enumerate(test):
                 gt = test_images[k:k+1].float() / 255.0
                 image, _, _, _ = render(test_viewmats[k:k+1], test_Ks[k:k+1], sh_degree)
                 psnrs.append((-10.0 * torch.log10(((image - gt)**2).mean())).item())
                 ssims.append(ssim(image.permute(0, 3, 1, 2), gt.permute(0, 3, 1, 2)).item())
-                side = torch.cat([gt[0], image[0]], 1)  # ground truth | render
+                if k in aligned:
+                    viewmat, expo = aligned[k]
+                    image, _, _, _ = render(viewmat, test_Ks[k:k+1], sh_degree)
+                    image = (image * torch.exp(expo[:3]) + expo[3:]).clamp(0, 1)
+                    psnrs_a.append((-10.0 * torch.log10(((image - gt)**2).mean())).item())
+                    ssims_a.append(ssim(image.permute(0, 3, 1, 2), gt.permute(0, 3, 1, 2)).item())
+                side = torch.cat([gt[0], image[0]], 1)  # ground truth | render (aligned when fitted)
                 Image.fromarray((side.cpu().numpy() * 255).astype(np.uint8)).save(
                     os.path.join(args.output, 'renders', os.path.splitext(im['name'])[0] + '.png'))
             stats.update(test_images=len(test), psnr=float(np.mean(psnrs)), ssim=float(np.mean(ssims)))
             print('Test images: PSNR %.2f dB, SSIM %.4f' % (stats['psnr'], stats['ssim']))
+            if psnrs_a:
+                stats.update(psnr_aligned=float(np.mean(psnrs_a)), ssim_aligned=float(np.mean(ssims_a)))
+                print('Test images with fitted pose and exposure: PSNR %.2f dB, SSIM %.4f' % (stats['psnr_aligned'], stats['ssim_aligned']))
         if args.pose_lr > 0:
             refined = {im['name']: train_viewmat(k)[0].cpu().numpy().tolist() for k, im in enumerate(trainset)}
             json.dump(refined, open(os.path.join(args.output, 'refined_viewmats.json'), 'w'))
@@ -352,6 +383,7 @@ def main():
     parser.add_argument('--dist-from', type=int, default=3000, help='2dgs: step where the distortion loss starts')
     parser.add_argument('--pose-lr', type=float, default=2e-5, help='Learning rate of the camera pose corrections (0 = SLAM poses as they are)')
     parser.add_argument('--exposure', type=int, default=1, help='Fit a color gain and offset per training image (1) or not (0)')
+    parser.add_argument('--test-align-steps', type=int, default=200, help='With --pose-lr: steps fitting the pose and exposure of each held-out image before evaluation')
     parser.add_argument('--grow-grad', type=float, default=0.0002, help='Densification threshold of the 2D position gradient (higher = fewer Gaussians)')
     parser.add_argument('--max-gaussians', type=int, default=3000000, help='Densification stops above this count (0 = no limit)')
     parser.add_argument('--test-every', type=int, default=8, help='Hold out every Nth image for evaluation (0 = none)')
