@@ -142,6 +142,12 @@ python3 eval_mesh.py OUT/colmap OUT/colmap/2dgs/mesh.ply OUT/colmap/stereo_mesh.
   forbids commercial use). The rendered depth is fitted to `depths/` (`--depth-weight`).
 - Windows: Python 3.10 is used (pre-compiled gsplat wheels exist for cp310 + PyTorch 2.4 only;
   `conda create -p tools\GaussianSplatting\.py310 python=3.10` when `py -3.10` is missing).
+- Render quality (3dgs mode): `rtabmap_to_colmap.py --extra-rate 8` adds the sharpest color
+  image of each 1/8 s between the keyframes (interpolated pose, own stereo depth), listed
+  in `frames.txt`; train_gsplat.py then still holds out the same keyframe images and
+  skips the extra images next to them. `--min-sharpness 0.5` leaves out blurred training
+  images, `--strategy mcmc` / `--absgrad` / `--antialiased` are gsplat's densification and
+  rasterization options, and LPIPS is reported when the `lpips` package (BSD-2) is installed.
 - `extract_mesh.py` renders the median depth of every training image and fuses it in
   an Open3D TSDF volume (`--voxel 0.02` m), then removes small pieces.
   `--method poisson` fits a screened Poisson surface (Open3D) to the rendered depth

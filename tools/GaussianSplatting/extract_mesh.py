@@ -32,7 +32,7 @@ import numpy as np
 from PIL import Image
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from train_gsplat import read_colmap_text, load_images  # noqa: E402
+from train_gsplat import read_colmap_text, load_images, split_images  # noqa: E402
 
 
 def read_gaussians(path):
@@ -239,7 +239,7 @@ def main():
                              else os.path.join(args.data, 'stereo_mesh%s.ply' % suffix))
 
     cameras, images, _, _ = read_colmap_text(args.data)
-    images = [im for k, im in enumerate(images) if not (test_every > 0 and k % test_every == 0)]
+    images, _ = split_images(args.data, images, test_every)
     load_images(args.data, cameras, images, factor)
     height, width = images[0]['image'].shape[:2]
     refined = os.path.join(model_dir, 'refined_viewmats.json')

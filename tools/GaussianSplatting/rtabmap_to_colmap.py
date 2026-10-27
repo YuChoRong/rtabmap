@@ -24,6 +24,13 @@ images are exported instead of the infrared ones, and depth maps are added:
                                 stereo pair of the keyframe (OpenCV SGBM), 0 = unknown; from the
                                 nearest pair with the emitter on when mav0/cam0_emitter exists
   OUT/sparse/0/points3D.txt     colored points back-projected from the depth maps
+  OUT/frames.txt                name, stamp and keyframe flag (1) of each image
+
+--extra-rate HZ adds color images between the keyframes (the sharpest one in each
+1/HZ s slot, pose interpolated between the keyframes, depth from its own infrared
+pair): more views for the Gaussians. Their names start with x, so train_gsplat.py
+still holds out the same keyframe images for evaluation (and also leaves out the
+extra images next to them).
 
 Usage: rtabmap_to_colmap.py map.db OUT [--euroc DIR] [--rtabmap-export PATH] [--voxel 0.02] [--max-points 200000]
 """
@@ -221,6 +228,9 @@ def project_depth(depth_ir, K_ir, T_rgb_ir, K_rgb, size_rgb):
     return out
 
 
+EXTRA_ID = 1000000  # image ids of the extra images (keyframe images keep their node id)
+
+
 def export_euroc_color(args, cameras, out_images, out_depths):
     """Color images, their poses and depth maps from the EuRoC recording. Returns (names, poses, K, size, points)."""
     import cv2
@@ -247,7 +257,29 @@ def export_euroc_color(args, cameras, out_images, out_depths):
     left_stamps = np.array([f[0] for f in left_frames])
     right_by_stamp = {round(f[0], 4): f[1] for f in right_frames}
 
+    def depth_at(stamp, T_w_rgb):
+        """Depth of the infrared pair nearest to stamp, moved to the color camera (None if no pair)."""
+        li = int(np.argmin(np.abs(left_stamps - stamp)))
+        right_path = right_by_stamp.get(round(left_stamps[li], 4))
+        if abs(left_stamps[li] - stamp) > (0.04 if emitter else 0.02) or right_path is None:
+            return None
+        left = cv2.imread(left_frames[li][1], cv2.IMREAD_GRAYSCALE)
+        right = cv2.imread(right_path, cv2.IMREAD_GRAYSCALE)
+        if left is None or right is None:
+            return None
+        depth_ir = stereo_depth(left, right, K_ir[0, 0], baseline, args.max_depth)
+        T_rgb_ir = np.linalg.inv(T_w_rgb) @ interpolate_pose(kf_stamps, kf_poses, left_stamps[li])
+        return project_depth(depth_ir, K_ir, T_rgb_ir, K_rgb, size_rgb)
+
+    def save(i, name, j, img, T_w_rgb, depth):
+        cv2.imwrite(os.path.join(out_images, name), img, [cv2.IMWRITE_JPEG_QUALITY, 95])
+        names[i] = name
+        poses[i] = (rgb_stamps[j], T_w_rgb[:3, :3].tolist(), T_w_rgb[:3, 3].tolist())
+        if depth is not None:
+            cv2.imwrite(os.path.join(out_depths, os.path.splitext(name)[0] + '.png'), np.round(depth * 1000).astype(np.uint16))
+
     names, poses, points, colors = {}, {}, [], []
+    keyframe_rgb = set()
     rng = np.random.default_rng(0)
     for k, i in enumerate(ids):
         stamp = kf_stamps[k]
@@ -260,24 +292,12 @@ def export_euroc_color(args, cameras, out_images, out_depths):
         if img is None:
             print('Cannot read %s, skipped' % rgb_frames[j][1])
             continue
-        name = '%d.jpg' % i
-        cv2.imwrite(os.path.join(out_images, name), img, [cv2.IMWRITE_JPEG_QUALITY, 95])
-        names[i] = name
-        poses[i] = (rgb_stamps[j], T_w_rgb[:3, :3].tolist(), T_w_rgb[:3, 3].tolist())
-
         # Depth of the keyframe's infrared pair, moved to the color camera at the color stamp
-        li = int(np.argmin(np.abs(left_stamps - stamp)))
-        right_path = right_by_stamp.get(round(left_stamps[li], 4))
-        if abs(left_stamps[li] - stamp) > (0.04 if emitter else 0.002) or right_path is None:
+        depth = depth_at(stamp, T_w_rgb)
+        save(i, '%d.jpg' % i, j, img, T_w_rgb, depth)
+        keyframe_rgb.add(j)
+        if depth is None:
             continue
-        left = cv2.imread(left_frames[li][1], cv2.IMREAD_GRAYSCALE)
-        right = cv2.imread(right_path, cv2.IMREAD_GRAYSCALE)
-        if left is None or right is None:
-            continue
-        depth_ir = stereo_depth(left, right, K_ir[0, 0], baseline, args.max_depth)
-        T_rgb_ir = np.linalg.inv(T_w_rgb) @ interpolate_pose(kf_stamps, kf_poses, left_stamps[li])
-        depth = project_depth(depth_ir, K_ir, T_rgb_ir, K_rgb, size_rgb)
-        cv2.imwrite(os.path.join(out_depths, '%d.png' % i), np.round(depth * 1000).astype(np.uint16))
 
         # Colored initial points from a random subset of the depth pixels
         v, u = np.nonzero(depth)
@@ -291,6 +311,29 @@ def export_euroc_color(args, cameras, out_images, out_depths):
         colors.append(img[v, u, ::-1])
         if k % 20 == 0:
             print('%d/%d keyframes, %.0f%% of the color pixels with depth' % (k + 1, len(ids), 100.0 * np.count_nonzero(depth) / depth.size))
+
+    if args.extra_rate > 0:
+        # Sharpest color image (variance of the Laplacian) of each 1/rate slot between the keyframes
+        slot = np.floor((rgb_stamps - kf_stamps[0]) * args.extra_rate).astype(int)
+        inside = (rgb_stamps > kf_stamps[0]) & (rgb_stamps < kf_stamps[-1])
+        kf_slots = {slot[j] for j in keyframe_rgb}
+        best = {}
+        for j in np.nonzero(inside)[0]:
+            if slot[j] in kf_slots:
+                continue
+            gray = cv2.imread(rgb_frames[j][1], cv2.IMREAD_GRAYSCALE)
+            if gray is None:
+                continue
+            sharp = cv2.Laplacian(cv2.resize(gray, None, fx=0.5, fy=0.5), cv2.CV_32F).var()
+            if slot[j] not in best or sharp > best[slot[j]][1]:
+                best[slot[j]] = (j, sharp)
+        for n, (j, _) in enumerate(sorted(best.values())):
+            T_w_rgb = interpolate_pose(kf_stamps, kf_poses, rgb_stamps[j]) @ T_c0_rgb
+            img = cv2.imread(rgb_frames[j][1], cv2.IMREAD_COLOR)
+            save(EXTRA_ID + n, 'x%05d.jpg' % n, j, img, T_w_rgb, depth_at(rgb_stamps[j], T_w_rgb))
+            if n % 50 == 0:
+                print('%d/%d extra images' % (n + 1, len(best)))
+        print('%d extra images between the keyframes (%.1f per second)' % (len(best), args.extra_rate))
 
     pts = []
     if points:
@@ -328,6 +371,7 @@ def main():
     parser.add_argument('--euroc', help='EuRoC-layout recording of the map with mav0/rgb: export color images and depth maps.')
     parser.add_argument('--max-depth', type=float, default=4.0, help='Maximum stereo depth (m) with --euroc.')
     parser.add_argument('--max-dt', type=float, default=0.02, help='Maximum time (s) between a keyframe and its color image with --euroc.')
+    parser.add_argument('--extra-rate', type=float, default=0, help='--euroc: color images added between the keyframes, per second (0 = keyframes only).')
     args = parser.parse_args()
 
     tmp = tempfile.mkdtemp(prefix='rtabmap_colmap_')
@@ -400,6 +444,10 @@ def main():
                 qw, qx, qy, qz = rot_to_quat(Rcw)
                 f.write('%d %.9f %.9f %.9f %.9f %.9f %.9f %.9f 1 %s\n\n' % (i, qw, qx, qy, qz, tcw[0], tcw[1], tcw[2], names[i]))
         write_poses(os.path.join(args.output, 'camera_poses.txt'), {i: cameras[i] for i in names})
+        with open(os.path.join(args.output, 'frames.txt'), 'w') as f:
+            f.write('# NAME STAMP KEYFRAME\n')
+            for i in sorted(names, key=lambda i: cameras[i][0]):
+                f.write('%s %.6f %d\n' % (names[i], cameras[i][0], 0 if i >= EXTRA_ID else 1))
 
         gt_path = os.path.join(tmp, 'map_gt_poses.txt')
         gt_count = 0

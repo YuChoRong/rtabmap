@@ -64,7 +64,7 @@ if (-not $ready) {
     & $python -m pip install --upgrade pip
     & $python -m pip install "torch==$Torch" --index-url "https://download.pytorch.org/whl/$Cuda"
     if ($LASTEXITCODE -ne 0) { throw "PyTorch installation failed (check -Cuda, e.g. cu118, cu121, cu124, cu126)" }
-    & $python -m pip install numpy pillow opencv-python-headless open3d
+    & $python -m pip install numpy pillow opencv-python-headless open3d lpips
     # Pre-compiled gsplat for this PyTorch and CUDA, e.g. pt24cu124
     $tag = & $python -c "import torch; v=torch.__version__.split('+')[0].split('.'); print('pt%s%scu%s' % (v[0], v[1], torch.version.cuda.replace('.', '')))"
     # Dependencies from PyPI, then gsplat only from its wheel index (a newer PyPI version would have no binaries)

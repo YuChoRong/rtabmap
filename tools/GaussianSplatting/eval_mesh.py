@@ -21,7 +21,7 @@ import argparse, json, os, sys
 import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from train_gsplat import read_colmap_text, load_images  # noqa: E402
+from train_gsplat import read_colmap_text, load_images, split_images  # noqa: E402
 
 
 def mesh_depth(scene, im, width, height):
@@ -73,7 +73,7 @@ def main():
     args = parser.parse_args()
 
     cameras, images, _, _ = read_colmap_text(args.data)
-    test = [im for k, im in enumerate(images) if args.test_every > 0 and k % args.test_every == 0]
+    _, test = split_images(args.data, images, args.test_every)
     load_images(args.data, cameras, test, args.factor)
     test = [im for im in test if im['depth'] is not None]
     if not test:
