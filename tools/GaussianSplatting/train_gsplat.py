@@ -450,7 +450,7 @@ def main():
     parser.add_argument('--factor', type=int, default=1, help='Image downscale factor')
     parser.add_argument('--sh-degree', type=int, default=3)
     parser.add_argument('--mode', choices=['3dgs', '2dgs'], default='3dgs', help='3D Gaussians, or 2D Gaussians (disks) for meshes')
-    parser.add_argument('--depth-weight', type=float, default=0.1, help='Weight of the L1 depth loss (m) when DATA/depths exists (0 = off)')
+    parser.add_argument('--depth-weight', type=float, default=0.5, help='Weight of the L1 depth loss (m) when DATA/depths exists (0 = off)')
     parser.add_argument('--normal-weight', type=float, default=0.05, help='2dgs: normal consistency weight')
     parser.add_argument('--normal-from', type=int, default=7000, help='2dgs: step where the normal loss starts')
     parser.add_argument('--dist-weight', type=float, default=0.01, help='2dgs: depth distortion weight')
