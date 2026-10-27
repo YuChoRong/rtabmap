@@ -16,6 +16,9 @@ With --method poisson, the rendered depth pixels become an oriented point cloud
 surface is fitted: it fills the holes left where no depth is known (shiny floor,
 object edges). The surface is cut where it is farther than --poisson-trim from the
 points, so only holes up to about twice that size are filled.
+With --method hybrid (default for models), the TSDF mesh is kept as it is and only
+the parts of the Poisson surface farther than --hybrid-gap from it (the holes) are
+added: the accuracy of TSDF with the coverage of Poisson.
 The images held out by train_gsplat.py (--test-every) are not fused, so
 eval_mesh.py can check the mesh on them.
 
@@ -157,6 +160,20 @@ def poisson(views, images, voxel, max_depth, trim, depth_level):
     return mesh, count
 
 
+def hybrid(tsdf, filler, gap):
+    """TSDF mesh plus the triangles of the Poisson surface that lie in its holes."""
+    import open3d as o3d
+    scene = o3d.t.geometry.RaycastingScene()
+    scene.add_triangles(o3d.t.geometry.TriangleMesh.from_legacy(tsdf))
+    vertices = np.asarray(filler.vertices, np.float32)
+    far = scene.compute_distance(o3d.core.Tensor(vertices)).numpy() > gap
+    triangles = np.asarray(filler.triangles)
+    filler.remove_triangles_by_mask(~far[triangles].any(1))   # keep the triangles touching a hole
+    filler.remove_unreferenced_vertices()
+    print('%d triangles added in the holes of the TSDF mesh' % len(filler.triangles))
+    return tsdf + filler
+
+
 def clean(mesh, min_triangles):
     """Removes the connected pieces with fewer than min_triangles triangles."""
     clusters, sizes, _ = mesh.cluster_connected_triangles()
@@ -170,11 +187,14 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('data', help='COLMAP folder of rtabmap_to_colmap.py')
     parser.add_argument('--source', choices=['model', 'stereo'], default='model')
-    parser.add_argument('--method', choices=['tsdf', 'poisson'], default='tsdf',
-                        help='tsdf: TSDF fusion; poisson: screened Poisson surface, fills holes')
+    parser.add_argument('--method', choices=['tsdf', 'poisson', 'hybrid'], default='tsdf',
+                        help='tsdf: TSDF fusion; poisson: screened Poisson surface, fills holes; '
+                             'hybrid: TSDF mesh with its holes filled by the Poisson surface')
     parser.add_argument('--poisson-depth', type=int, default=9, help='Octree depth of the Poisson surface (9: about 2 cm cells in a 10 m scene)')
-    parser.add_argument('--poisson-trim', type=float, default=0.05,
+    parser.add_argument('--poisson-trim', type=float, default=0.03,
                         help='Poisson surface farther than this from the depth points is removed (m)')
+    parser.add_argument('--hybrid-gap', type=float, default=0.03,
+                        help='hybrid: Poisson triangles farther than this from the TSDF mesh fill its holes (m)')
     parser.add_argument('--model', help='Model folder (default DATA/3dgs)')
     parser.add_argument('--output', help='Mesh PLY (default MODEL/mesh.ply, or DATA/stereo_mesh.ply)')
     parser.add_argument('--voxel', type=float, default=0.02, help='TSDF voxel size (m)')
@@ -196,7 +216,7 @@ def main():
         meta = json.load(open(os.path.join(model_dir, 'model.json')))
     factor = args.factor or meta.get('factor', 1)
     test_every = args.test_every if args.test_every >= 0 else meta.get('test_every', 8)
-    suffix = '' if args.method == 'tsdf' else '_poisson'
+    suffix = '' if args.method == 'tsdf' else '_' + args.method
     output = args.output or (os.path.join(model_dir, 'mesh%s.ply' % suffix) if args.source == 'model'
                              else os.path.join(args.data, 'stereo_mesh%s.ply' % suffix))
 
@@ -220,10 +240,13 @@ def main():
         if not any(im['depth'] is not None for im in images):
             sys.exit('No depth map in %s/depths (export with rtabmap_to_colmap.py --euroc)' % args.data)
         views = stereo_views(images)
-    if args.method == 'poisson':
+    if args.method == 'hybrid':
+        views = list(views)   # used twice
+    if args.method != 'tsdf':
         mesh, count = poisson(views, images, args.voxel, args.max_depth, args.poisson_trim, args.poisson_depth)
-    else:
-        mesh, count = fuse(views, images, args.voxel, args.max_depth, args.device, args.min_weight)
+    if args.method != 'poisson':
+        tsdf, count = fuse(views, images, args.voxel, args.max_depth, args.device, args.min_weight)
+        mesh = hybrid(clean(tsdf, args.min_triangles), mesh, args.hybrid_gap) if args.method == 'hybrid' else tsdf
     raw = len(mesh.triangles)
     mesh = clean(mesh, args.min_triangles)
     import open3d as o3d

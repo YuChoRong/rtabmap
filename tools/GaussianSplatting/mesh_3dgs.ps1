@@ -11,7 +11,7 @@
 #   2. rtabmap_to_colmap.py --euroc: color images, poses, stereo depth -> OUT\colmap
 #   3. train_gsplat.py --mode 2dgs (environment of train_3dgs.ps1)    -> OUT\colmap\2dgs
 #   4. extract_mesh.py: TSDF fusion of the rendered depth              -> OUT\colmap\2dgs\mesh.ply
-#      and Poisson surface of the rendered depth (fills holes)         -> OUT\colmap\2dgs\mesh_poisson.ply
+#      and the same with holes filled by a Poisson surface            -> OUT\colmap\2dgs\mesh_hybrid.ply
 #   5. Baselines: TSDF of the stereo depth (OUT\colmap\stereo_mesh.ply) and
 #      RTAB-Map's Poisson mesh (OUT\poisson_mesh.ply)
 #   6. eval_mesh.py on the held-out images                            -> OUT\mesh_eval.json
@@ -136,9 +136,9 @@ if (-not (Test-Path (Join-Path $model "mesh.ply"))) {
     Step "4/6 Mesh of the 2DGS model"
     Run-Python @((Join-Path $PSScriptRoot "extract_mesh.py"), $colmap, "--model", $model)
 }
-if (-not (Test-Path (Join-Path $model "mesh_poisson.ply"))) {
-    Step "4/6 Mesh of the 2DGS model, holes filled (Poisson of the rendered depth)"
-    Run-Python @((Join-Path $PSScriptRoot "extract_mesh.py"), $colmap, "--model", $model, "--method", "poisson")
+if (-not (Test-Path (Join-Path $model "mesh_hybrid.ply"))) {
+    Step "4/6 Mesh of the 2DGS model, holes of the TSDF mesh filled by a Poisson surface"
+    Run-Python @((Join-Path $PSScriptRoot "extract_mesh.py"), $colmap, "--model", $model, "--method", "hybrid")
 }
 
 # 5. Baselines
@@ -154,7 +154,7 @@ if (-not (Test-Path $poisson)) {
 
 # 6. Evaluation
 Step "6/6 Comparison on the held-out images"
-$meshes = @((Join-Path $model "mesh.ply"), (Join-Path $model "mesh_poisson.ply"), (Join-Path $colmap "stereo_mesh.ply"))
+$meshes = @((Join-Path $model "mesh.ply"), (Join-Path $model "mesh_hybrid.ply"), (Join-Path $colmap "stereo_mesh.ply"))
 if (Test-Path $poisson) { $meshes += $poisson }
 Run-Python (@((Join-Path $PSScriptRoot "eval_mesh.py"), $colmap) + $meshes + @("--json", (Join-Path $Out "mesh_eval.json")))
 Step "Done: $(Join-Path $model 'mesh.ply')"
