@@ -30,6 +30,8 @@ param(
     [string]$Venv = ""
 )
 $ErrorActionPreference = "Stop"
+# Progress lines of the Python steps show up as they are printed, also when the output is piped
+$env:PYTHONUNBUFFERED = "1"
 # PowerShell 5: $PSScriptRoot is empty in param() defaults
 if (-not $Venv) { $Venv = Join-Path $PSScriptRoot ".gs_env" }
 if (-not $Euroc -and -not $Bag) { throw "Give -Euroc (converted recording) or -Bag (RealSense Viewer recording)" }
