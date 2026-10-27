@@ -11,6 +11,7 @@
 #   2. rtabmap_to_colmap.py --euroc: color images, poses, stereo depth -> OUT\colmap
 #   3. train_gsplat.py --mode 2dgs (environment of train_3dgs.ps1)    -> OUT\colmap\2dgs
 #   4. extract_mesh.py: TSDF fusion of the rendered depth              -> OUT\colmap\2dgs\mesh.ply
+#      and Poisson surface of the rendered depth (fills holes)         -> OUT\colmap\2dgs\mesh_poisson.ply
 #   5. Baselines: TSDF of the stereo depth (OUT\colmap\stereo_mesh.ply) and
 #      RTAB-Map's Poisson mesh (OUT\poisson_mesh.ply)
 #   6. eval_mesh.py on the held-out images                            -> OUT\mesh_eval.json
@@ -25,6 +26,7 @@ param(
     [double]$DetectionRate = 4,
     [string]$SlamArgs = "--Odom/Strategy 15 --OdomVIO/TimeOffset -0.037 --Rtabmap/ImagesAlreadyRectified true",
     [int]$Steps = 30000,
+    [int]$MaxGaussians = 1500000,   # more did not improve the mesh (20261027 recording), only the time
     [int]$Factor = 2,          # half resolution: 3x faster than 1, mesh as good (20261027 emitter recording)
     [string]$Cuda = "cu124",
     [string]$Venv = ""
@@ -126,13 +128,17 @@ if (-not (Test-Path (Join-Path $colmap "sparse\0\images.txt"))) {
 if (-not (Test-Path (Join-Path $model "point_cloud.ply"))) {
     Step "3/6 2DGS training ($Steps steps)"
     Run-Python @((Join-Path $PSScriptRoot "train_gsplat.py"), $colmap, "--output", $model, "--mode", "2dgs",
-                 "--steps", "$Steps", "--factor", "$Factor")
+                 "--steps", "$Steps", "--factor", "$Factor", "--max-gaussians", "$MaxGaussians")
 }
 
 # 4. Mesh
 if (-not (Test-Path (Join-Path $model "mesh.ply"))) {
     Step "4/6 Mesh of the 2DGS model"
     Run-Python @((Join-Path $PSScriptRoot "extract_mesh.py"), $colmap, "--model", $model)
+}
+if (-not (Test-Path (Join-Path $model "mesh_poisson.ply"))) {
+    Step "4/6 Mesh of the 2DGS model, holes filled (Poisson of the rendered depth)"
+    Run-Python @((Join-Path $PSScriptRoot "extract_mesh.py"), $colmap, "--model", $model, "--method", "poisson")
 }
 
 # 5. Baselines
@@ -148,7 +154,7 @@ if (-not (Test-Path $poisson)) {
 
 # 6. Evaluation
 Step "6/6 Comparison on the held-out images"
-$meshes = @((Join-Path $model "mesh.ply"), (Join-Path $colmap "stereo_mesh.ply"))
+$meshes = @((Join-Path $model "mesh.ply"), (Join-Path $model "mesh_poisson.ply"), (Join-Path $colmap "stereo_mesh.ply"))
 if (Test-Path $poisson) { $meshes += $poisson }
 Run-Python (@((Join-Path $PSScriptRoot "eval_mesh.py"), $colmap) + $meshes + @("--json", (Join-Path $Out "mesh_eval.json")))
 Step "Done: $(Join-Path $model 'mesh.ply')"

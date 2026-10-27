@@ -4,12 +4,18 @@
   python extract_mesh.py DATA                       # model DATA/3dgs (made by train_gsplat.py) -> DATA/3dgs/mesh.ply
   python extract_mesh.py DATA --model DATA/2dgs     # another model folder
   python extract_mesh.py DATA --source stereo       # baseline without Gaussians: DATA/depths -> DATA/stereo_mesh.ply
+  python extract_mesh.py DATA --model DATA/2dgs --method poisson   # holes filled -> DATA/2dgs/mesh_poisson.ply
 
 DATA is a COLMAP folder made by rtabmap_to_colmap.py (sparse/0, images/, depths/).
 With a model, the depth and color of every training image are rendered with gsplat
 (median depth for 2dgs models by default, expected depth for 3dgs models, pixels with an
 opacity under --min-alpha are left out) and fused in an Open3D TSDF volume; the mesh
 is the zero level set (marching cubes). Small disconnected pieces are removed.
+With --method poisson, the rendered depth pixels become an oriented point cloud
+(normals rendered by 2dgs models, estimated otherwise) and a screened Poisson
+surface is fitted: it fills the holes left where no depth is known (shiny floor,
+object edges). The surface is cut where it is farther than --poisson-trim from the
+points, so only holes up to about twice that size are filled.
 The images held out by train_gsplat.py (--test-every) are not fused, so
 eval_mesh.py can check the mesh on them.
 
@@ -49,7 +55,8 @@ def read_gaussians(path):
 
 
 def render_views(model_dir, images, width, height, min_alpha, depth_mode):
-    """Yields (image index, rgb uint8 [H, W, 3], depth float32 [H, W]) rendered from the model."""
+    """Yields (image index, rgb uint8 [H, W, 3], depth float32 [H, W], world normals [H, W, 3] or None)
+    rendered from the model."""
     import torch
     from gsplat import rasterization, rasterization_2dgs
     meta = json.load(open(os.path.join(model_dir, 'model.json')))
@@ -65,21 +72,23 @@ def render_views(model_dir, images, width, height, min_alpha, depth_mode):
             K = torch.tensor(im['K'], dtype=torch.float32, device=device)[None]
             a = (t['means'], torch.nn.functional.normalize(t['quats'], dim=-1), torch.exp(t['scales']),
                  torch.sigmoid(t['opacities']), colors, viewmat, K, width, height)
+            normals = None
             if meta['mode'] == '2dgs':
-                out, alphas, _, _, _, median, _ = rasterization_2dgs(*a, sh_degree=degree, packed=False, render_mode='RGB+ED')
+                out, alphas, normals, _, _, median, _ = rasterization_2dgs(*a, sh_degree=degree, packed=False, render_mode='RGB+ED')
                 depth = median[0, ..., 0] if depth_mode == 'median' else out[0, ..., 3]
+                normals = normals[0].float().cpu().numpy()
             else:
                 out, alphas, _ = rasterization(*a, sh_degree=degree, packed=False, render_mode='RGB+ED')
                 depth = out[0, ..., 3]
             depth = torch.where(alphas[0, ..., 0] >= min_alpha, depth, torch.zeros_like(depth))
             rgb = (out[0, ..., :3].clamp(0, 1) * 255).byte()
-            yield k, rgb.cpu().numpy(), depth.float().cpu().numpy()
+            yield k, rgb.cpu().numpy(), depth.float().cpu().numpy(), normals
 
 
 def stereo_views(images):
     for k, im in enumerate(images):
         if im['depth'] is not None:
-            yield k, im['image'], im['depth']
+            yield k, im['image'], im['depth'], None
 
 
 def fuse(views, images, voxel, max_depth, device, min_weight):
@@ -91,7 +100,7 @@ def fuse(views, images, voxel, max_depth, device, min_weight):
         attr_names=('tsdf', 'weight', 'color'), attr_dtypes=(o3c.float32, o3c.float32, o3c.float32),
         attr_channels=((1), (1), (3)), voxel_size=voxel, block_resolution=8, block_count=100000, device=dev)
     count = 0
-    for k, rgb, depth in views:
+    for k, rgb, depth, _ in views:
         if not np.any((depth > 0) & (depth < max_depth)):
             continue  # Open3D aborts on a view that touches no voxel
         intrinsic = o3c.Tensor(images[k]['K'], o3c.float64)
@@ -104,6 +113,48 @@ def fuse(views, images, voxel, max_depth, device, min_weight):
                       depth_max=max_depth, trunc_voxel_multiplier=4.0)
         count += 1
     return vbg.extract_triangle_mesh(weight_threshold=min_weight).to_legacy(), count
+
+
+def poisson(views, images, voxel, max_depth, trim, depth_level):
+    """Screened Poisson surface of the depth pixels of all views (Open3D), cut far from the points."""
+    import open3d as o3d
+    points, colors, normals, count = [], [], [], 0
+    for k, rgb, depth, nrm in views:
+        valid = (depth > 0) & (depth < max_depth)
+        if not np.any(valid):
+            continue
+        K, viewmat = images[k]['K'], images[k]['viewmat']
+        v, u = np.nonzero(valid)
+        z = depth[v, u]
+        cam = np.stack([(u + 0.5 - K[0, 2]) / K[0, 0] * z, (v + 0.5 - K[1, 2]) / K[1, 1] * z, z], -1)
+        R_wc = viewmat[:3, :3].T
+        points.append((cam - viewmat[:3, 3]) @ R_wc.T)
+        colors.append(rgb[v, u] / 255.0)
+        normals.append(nrm[v, u] if nrm is not None else np.zeros((len(z), 3)))
+        count += 1
+    cloud = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(np.concatenate(points)))
+    cloud.colors = o3d.utility.Vector3dVector(np.concatenate(colors))
+    cloud.normals = o3d.utility.Vector3dVector(np.concatenate(normals))
+    cloud = cloud.voxel_down_sample(voxel / 2)
+    n = np.asarray(cloud.normals)
+    if not np.any(n):
+        # No rendered normals (stereo depth, 3dgs model): estimate them, facing the cameras
+        cloud.estimate_normals(o3d.geometry.KDTreeSearchParamHybrid(radius=4 * voxel, max_nn=30))
+        centers = np.array([-im['viewmat'][:3, :3].T @ im['viewmat'][:3, 3] for im in images])
+        p = np.asarray(cloud.points)
+        to_cam = centers.mean(0) - p
+        n = np.asarray(cloud.normals)
+        flip = np.sum(n * to_cam, 1) < 0
+        n[flip] *= -1
+        cloud.normals = o3d.utility.Vector3dVector(n)
+    else:
+        cloud.normals = o3d.utility.Vector3dVector(n / np.maximum(np.linalg.norm(n, axis=1, keepdims=True), 1e-9))
+    print('%d points from %d views' % (len(cloud.points), count))
+    mesh, _ = o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(cloud, depth=depth_level)
+    # Cut the surface far from the points (Poisson closes the scene into a watertight blob)
+    dist = np.asarray(o3d.geometry.PointCloud(mesh.vertices).compute_point_cloud_distance(cloud))
+    mesh.remove_vertices_by_mask(dist > trim)
+    return mesh, count
 
 
 def clean(mesh, min_triangles):
@@ -119,6 +170,11 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('data', help='COLMAP folder of rtabmap_to_colmap.py')
     parser.add_argument('--source', choices=['model', 'stereo'], default='model')
+    parser.add_argument('--method', choices=['tsdf', 'poisson'], default='tsdf',
+                        help='tsdf: TSDF fusion; poisson: screened Poisson surface, fills holes')
+    parser.add_argument('--poisson-depth', type=int, default=9, help='Octree depth of the Poisson surface (9: about 2 cm cells in a 10 m scene)')
+    parser.add_argument('--poisson-trim', type=float, default=0.05,
+                        help='Poisson surface farther than this from the depth points is removed (m)')
     parser.add_argument('--model', help='Model folder (default DATA/3dgs)')
     parser.add_argument('--output', help='Mesh PLY (default MODEL/mesh.ply, or DATA/stereo_mesh.ply)')
     parser.add_argument('--voxel', type=float, default=0.02, help='TSDF voxel size (m)')
@@ -140,8 +196,9 @@ def main():
         meta = json.load(open(os.path.join(model_dir, 'model.json')))
     factor = args.factor or meta.get('factor', 1)
     test_every = args.test_every if args.test_every >= 0 else meta.get('test_every', 8)
-    output = args.output or (os.path.join(model_dir, 'mesh.ply') if args.source == 'model'
-                             else os.path.join(args.data, 'stereo_mesh.ply'))
+    suffix = '' if args.method == 'tsdf' else '_poisson'
+    output = args.output or (os.path.join(model_dir, 'mesh%s.ply' % suffix) if args.source == 'model'
+                             else os.path.join(args.data, 'stereo_mesh%s.ply' % suffix))
 
     cameras, images, _, _ = read_colmap_text(args.data)
     images = [im for k, im in enumerate(images) if not (test_every > 0 and k % test_every == 0)]
@@ -163,7 +220,10 @@ def main():
         if not any(im['depth'] is not None for im in images):
             sys.exit('No depth map in %s/depths (export with rtabmap_to_colmap.py --euroc)' % args.data)
         views = stereo_views(images)
-    mesh, count = fuse(views, images, args.voxel, args.max_depth, args.device, args.min_weight)
+    if args.method == 'poisson':
+        mesh, count = poisson(views, images, args.voxel, args.max_depth, args.poisson_trim, args.poisson_depth)
+    else:
+        mesh, count = fuse(views, images, args.voxel, args.max_depth, args.device, args.min_weight)
     raw = len(mesh.triangles)
     mesh = clean(mesh, args.min_triangles)
     import open3d as o3d

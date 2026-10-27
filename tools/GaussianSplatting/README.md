@@ -126,6 +126,7 @@ rtabmap-euroc_dataset --Odom/Strategy 15 --Rtabmap/DetectionRate 4 --output OUT 
 python3 rtabmap_to_colmap.py OUT/map.db OUT/colmap --euroc REC/euroc_rgb   # color images, poses, depth maps
 python3 train_gsplat.py OUT/colmap --mode 2dgs --output OUT/colmap/2dgs     # 2D Gaussians + depth supervision
 python3 extract_mesh.py OUT/colmap --model OUT/colmap/2dgs                   # TSDF fusion of the rendered depth
+python3 extract_mesh.py OUT/colmap --model OUT/colmap/2dgs --method poisson  # Poisson surface of the rendered depth: fills holes (shiny floor, edges)
 python3 extract_mesh.py OUT/colmap --source stereo                          # baseline: TSDF of the stereo depth
 python3 eval_mesh.py OUT/colmap OUT/colmap/2dgs/mesh.ply OUT/colmap/stereo_mesh.ply
 ```
@@ -143,6 +144,10 @@ python3 eval_mesh.py OUT/colmap OUT/colmap/2dgs/mesh.ply OUT/colmap/stereo_mesh.
   `conda create -p tools\GaussianSplatting\.py310 python=3.10` when `py -3.10` is missing).
 - `extract_mesh.py` renders the median depth of every training image and fuses it in
   an Open3D TSDF volume (`--voxel 0.02` m), then removes small pieces.
+  `--method poisson` fits a screened Poisson surface (Open3D) to the rendered depth
+  points with the normals rendered by 2DGS, and removes the surface farther than
+  `--poisson-trim` (5 cm) from the points: holes where no depth is known (shiny
+  floor, edges) are filled, larger empty areas are not.
 - `eval_mesh.py` ray casts each mesh in the images held out from training and
   fusion (every 8th) and compares it with their stereo depth: share of stereo pixels
   where the mesh is within 2 / 5 cm, and median error. Stereo depth is noisy, so the
