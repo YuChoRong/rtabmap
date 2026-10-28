@@ -1984,12 +1984,12 @@ private:
 		s.db = path.toStdString();
 		s.cloud = cloudParams();
 		if(worker_.joinable()) worker_.join();
-		worker_ = std::thread([this, s]{
+		worker_ = std::thread([this, s, path]{
 			std::string error;
 			bool ok = false;
 			try {ok = engine_.view(s, error);}
 			catch(const std::exception & e) {error = e.what();}
-			gui([this, ok, error]{
+			gui([this, ok, error, path]{
 				busy_ = false;
 				setRunning(false);
 				mode_ = -1;

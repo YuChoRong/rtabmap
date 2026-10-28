@@ -18,11 +18,14 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from extract_mesh import read_gaussians  # noqa: E402
 
 
-def splats(path, max_count):
-    """(centers, covariances, rgbs, opacities) of the PLY model, the most opaque max_count ones."""
+def splats(path, max_count, max_scale):
+    """(centers, covariances, rgbs, opacities) of the PLY model, the most opaque max_count ones,
+    without the Gaussians larger than max_scale (m; floaters around the scene)."""
     g = read_gaussians(path)
     opacities = 1.0 / (1.0 + np.exp(-g['opacities']))
-    keep = np.argsort(-opacities)[:max_count] if 0 < max_count < len(opacities) else np.arange(len(opacities))
+    small = np.exp(g['scales']).max(1) <= max_scale if max_scale > 0 else np.ones(len(opacities), bool)
+    order = np.argsort(-np.where(small, opacities, -1.0))[:int(small.sum())]
+    keep = order[:max_count] if 0 < max_count < len(order) else order
     q = g['quats'][keep]
     q = q / np.linalg.norm(q, axis=1, keepdims=True)
     w, x, y, z = q.T
@@ -42,12 +45,13 @@ def main():
     parser.add_argument('--mesh', help='Mesh PLY to show too (e.g. mesh_hybrid.ply)')
     parser.add_argument('--port', type=int, default=8080)
     parser.add_argument('--max-gaussians', type=int, default=0, help='Show only the most opaque ones (0 = all)')
+    parser.add_argument('--max-scale', type=float, default=0.3, help='Leave out the Gaussians larger than this (m, 0 = none)')
     parser.add_argument('--no-browser', action='store_true', help='Do not open the browser')
     args = parser.parse_args()
     import viser
 
     path = os.path.join(args.model, 'point_cloud.ply') if os.path.isdir(args.model) else args.model
-    centers, cov, rgbs, opacities = splats(path, args.max_gaussians)
+    centers, cov, rgbs, opacities = splats(path, args.max_gaussians, args.max_scale)
     server = viser.ViserServer(port=args.port)
     server.scene.set_up_direction('+z')
     splat = server.scene.add_gaussian_splats('/gaussians', centers=centers, covariances=cov, rgbs=rgbs, opacities=opacities)
@@ -59,14 +63,25 @@ def main():
         show_mesh = server.gui.add_checkbox('Mesh', False)
         show_mesh.on_update(lambda _: setattr(mesh, 'visible', show_mesh.value))
 
-    # Start from above the middle of the model, looking at it
+    # Start at the first training camera (refined_viewmats.json of train_gsplat.py), else above the model
     center = np.median(centers, 0)
     extent = np.percentile(np.linalg.norm(centers - center, axis=1), 90)
+    position, look_at = center + np.array([-extent, -extent, extent]), center
+    views = os.path.join(os.path.dirname(path), 'refined_viewmats.json')
+    if os.path.exists(views):
+        import json
+        viewmats = json.load(open(views))
+        if viewmats:
+            V = np.array(viewmats[sorted(viewmats)[0]])
+            R_wc = V[:3, :3].T
+            position = -R_wc @ V[:3, 3]
+            look_at = position + R_wc[:, 2]
 
     @server.on_client_connect
     def _(client):
-        client.camera.position = tuple(center + np.array([-extent, -extent, extent]))
-        client.camera.look_at = tuple(center)
+        client.camera.position = tuple(position)
+        client.camera.look_at = tuple(look_at)
+        client.camera.up_direction = (0.0, 0.0, 1.0)  # map frame: z up
 
     url = 'http://localhost:%d' % args.port
     print('%d Gaussians of %s -> %s (Ctrl+C to stop)' % (len(centers), path, url), flush=True)
