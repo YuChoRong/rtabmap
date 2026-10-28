@@ -106,6 +106,68 @@ its LSD module is AGPL. The script always uses the CPU SIFT and COLMAP is
 only used as an external tool (not redistributed). A clean COLMAP binary is
 built with `-DCUDA_ENABLED=OFF -DOPENGL_ENABLED=OFF -DLSD_ENABLED=OFF -DCGAL_ENABLED=OFF`.
 
+## 5. Mesh with 2D Gaussian Splatting (D435i recordings with color)
+
+For a recording converted with `realsense_bag_to_euroc.py --rgb` (EuRoC layout
+with the color stream in `mav0/rgb`), one command on Windows makes the map, the
+model, the mesh and the comparison with two baselines:
+
+```bat
+mesh_3dgs.bat -Euroc C:\slam\data\20261013_105416\euroc_rgb
+```
+
+Results in `C:\slam\out\mesh_20261013_105416` (`-Out` to change it):
+`colmap\2dgs\mesh.ply` (the mesh, vertex colors), `colmap\stereo_mesh.ply` and
+`poisson_mesh.ply` (baselines), `mesh_eval.json`. A 3DGS model for viewing is also trained
+(`colmap_x8\3dgs\point_cloud.ply`: extra color images, MCMC strategy; `-NoRender` skips it). Each step is skipped when its
+result exists, so a run can be resumed. The steps, also usable alone (Linux too):
+
+```bash
+rtabmap-euroc_dataset --Odom/Strategy 15 --Rtabmap/DetectionRate 4 --output OUT --output_name map REC/euroc_rgb
+python3 rtabmap_to_colmap.py OUT/map.db OUT/colmap --euroc REC/euroc_rgb   # color images, poses, depth maps
+python3 train_gsplat.py OUT/colmap --mode 2dgs --output OUT/colmap/2dgs     # 2D Gaussians + depth supervision
+python3 extract_mesh.py OUT/colmap --model OUT/colmap/2dgs                   # TSDF fusion of the rendered depth
+python3 extract_mesh.py OUT/colmap --model OUT/colmap/2dgs --method hybrid   # same, holes filled by a Poisson surface (shiny floor, edges)
+python3 extract_mesh.py OUT/colmap --source stereo                          # baseline: TSDF of the stereo depth
+python3 eval_mesh.py OUT/colmap OUT/colmap/2dgs/mesh.ply OUT/colmap/stereo_mesh.ply
+```
+
+- `--euroc`: for each keyframe the nearest color image is exported, with the keyframe
+  pose interpolated at the color stamp and moved to the color camera (T_BS of the
+  `sensor.yaml` files). The depth of the keyframe's infrared pair (OpenCV SGBM) is
+  moved to the color camera as `depths/<id>.png` (16-bit mm). More keyframes
+  (`--Rtabmap/DetectionRate`) give a better model.
+- `--mode 2dgs` trains flat 2D Gaussians with the depth distortion and normal
+  consistency losses of 2DGS (Huang et al., SIGGRAPH 2024), written here on top of
+  gsplat's `rasterization_2dgs`; the original 2DGS code is not used (its license
+  forbids commercial use). The rendered depth is fitted to `depths/` (`--depth-weight`).
+- Windows: Python 3.10 is used (pre-compiled gsplat wheels exist for cp310 + PyTorch 2.4 only;
+  `conda create -p tools\GaussianSplatting\.py310 python=3.10` when `py -3.10` is missing).
+- Render quality (3dgs mode): `rtabmap_to_colmap.py --extra-rate 8` adds the sharpest color
+  image of each 1/8 s between the keyframes (interpolated pose, own stereo depth), listed
+  in `frames.txt`; train_gsplat.py then still holds out the same keyframe images and
+  skips the extra images next to them. `--min-sharpness 0.5` leaves out blurred training
+  images, `--strategy mcmc` / `--absgrad` / `--antialiased` are gsplat's densification and
+  rasterization options, and LPIPS is reported when the `lpips` package (BSD-2) is installed.
+- Viewing: `view_3dgs.py MODEL\point_cloud.ply [--mesh mesh_hybrid.ply]` shows the model in the
+  web browser (viser, MIT; `pip install viser` in the `.gs_env` environment). In
+  `rtabmap-live_viewer`, the 3DGS·메쉬 menu runs `mesh_3dgs.ps1` for the open map and its
+  recording (results in `<map>_3dgs`), shows the mesh over the map, and opens the 3DGS model
+  in the browser.
+- `extract_mesh.py` renders the median depth of every training image and fuses it in
+  an Open3D TSDF volume (`--voxel 0.02` m), then removes small pieces.
+  `--method poisson` fits a screened Poisson surface (Open3D) to the rendered depth
+  points with the normals rendered by 2DGS, and removes the surface farther than
+  `--poisson-trim` (3 cm) from the points: holes where no depth is known (shiny
+  floor, edges) are filled, larger empty areas are not. `--method hybrid` keeps the
+  TSDF mesh and adds the Poisson surface only in its holes (`mesh_hybrid.ply`).
+- `eval_mesh.py` ray casts each mesh in the images held out from training and
+  fusion (every 8th) and compares it with their stereo depth: share of stereo pixels
+  where the mesh is within 2 / 5 cm, and median error. Stereo depth is noisy, so the
+  numbers rank meshes, they are not absolute accuracy.
+
+Licenses: gsplat Apache-2.0, PyTorch BSD-3, Open3D MIT, OpenCV Apache-2.0, numpy BSD-3, Pillow MIT-CMU.
+
 ## Windows
 
 Tested parts: the Python scripts are platform independent, the C++ viewer

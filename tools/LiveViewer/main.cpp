@@ -31,6 +31,9 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 //     camera pose and image shown while they are built; the map is saved when stopped.
 //  2. real-time localization in a saved map, with the current pose and the map matches.
 //  3. offline viewing of a map built before (File > Open map).
+//  4. 3DGS / mesh of a map made from a recording (menu 3DGS·메쉬): runs
+//     tools/GaussianSplatting/mesh_3dgs.ps1 in the background, shows the mesh over the map,
+//     and opens the 3DGS model in the web browser (view_3dgs.py, viser).
 // The processing is the usual RTAB-Map pipeline (SensorCaptureThread -> OdometryThread ->
 // RtabmapThread) in this process; the 3D view is RTAB-Map's CloudViewer.
 // Korean UI strings: this file is UTF-8 (built with /utf-8 on MSVC).
@@ -67,6 +70,7 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include <rtabmap/utilite/UDirectory.h>
 #include <rtabmap/utilite/UConversion.h>
 #include <rtabmap/utilite/UStl.h>
+#include <pcl/io/ply_io.h>
 #include <opencv2/imgproc.hpp>
 #include <opencv2/imgcodecs.hpp>
 #include <yaml-cpp/yaml.h>
@@ -974,7 +978,7 @@ public:
 	{
 		// --auto map|loc|view --source realsense|REC --db OUT_DIR_OR_MAP [--rate F] [--screenshot PNG] [--exit]
 		// the window then waits in standby for the next task; only --exit (scripts) closes it at the end
-		QString mode, source, db;
+		QString mode, source, db, open;
 		for(int i=1; i<autoArgs_.size(); ++i)
 		{
 			QString a = autoArgs_[i];
@@ -986,7 +990,36 @@ public:
 			else if(a == "--features" && v) features_->setCurrentIndex(autoArgs_[++i] == "aliked"?1:0);
 			else if(a == "--screenshot" && v) screenshot_ = autoArgs_[++i];
 			else if(a == "--exit") exitWhenDone_ = true;
-			else if(a == "--open" && v) {openMap(autoArgs_[++i]); return;}
+			else if(a == "--open" && v) open = autoArgs_[++i];
+			else if(a == "--mesh" && v) mesh_ = autoArgs_[++i];
+			else if(a == "--splats" && v) splats_ = autoArgs_[++i];
+		}
+		if(!open.isEmpty())
+		{
+			openMap(open);
+		}
+		if(!mesh_.isEmpty() || !splats_.isEmpty())
+		{
+			// after the map (--open) is loaded
+			QTimer * wait = new QTimer(this);
+			connect(wait, &QTimer::timeout, this, [this, wait]{
+				if(busy_) return;
+				wait->deleteLater();
+				if(!mesh_.isEmpty()) {loadMesh(mesh_); fitView();}
+				if(!splats_.isEmpty()) openSplats(splats_);
+				if(!screenshot_.isEmpty())
+				{
+					QString shot = screenshot_;
+					screenshot_.clear();
+					QTimer::singleShot(1500, this, [this, shot]{saveScreenshot(shot); if(exitWhenDone_) close();});
+				}
+			});
+			wait->start(500);
+			return;
+		}
+		if(!open.isEmpty())
+		{
+			return;
 		}
 		if(mode.isEmpty())
 		{
@@ -1019,7 +1052,15 @@ protected:
 			if(worker_.joinable()) worker_.join();
 			engine_.stop();
 		}
+		if(gsProc_ && QMessageBox::question(this, tr8("종료"),
+				tr8("3DGS·메쉬를 만드는 중입니다. 중단하고 종료할까요?")) != QMessageBox::Yes)
+		{
+			event->ignore();
+			return;
+		}
 		if(worker_.joinable()) worker_.join();
+		killTree(gsProc_);
+		killTree(splatProc_);
 		event->accept();
 	}
 
@@ -1233,6 +1274,10 @@ private:
 		dl->addRow(tr8("점 크기"), pointSize_);
 		dl->addRow(follow_);
 		dl->addRow(showClouds_);
+		showMesh_ = new QCheckBox(tr8("메쉬 (3DGS·메쉬 메뉴)"));
+		showMesh_->setEnabled(false);
+		connect(showMesh_, &QCheckBox::toggled, this, [this](bool on){viewer_->setCloudVisibility("mesh", on); viewer_->refreshView();});
+		dl->addRow(showMesh_);
 		lay->addWidget(dispBox);
 		lay->addStretch(1);
 
@@ -1311,6 +1356,225 @@ private:
 		connect(m->addAction(tr8("위에서 보기")), &QAction::triggered, this, [this]{fitView(true);});
 		connect(m->addAction(tr8("카메라 시점")), &QAction::triggered, this, [this]{viewer_->resetCamera(); viewer_->refreshView();});
 		connect(m->addAction(tr8("화면 지우기")), &QAction::triggered, this, [this]{clearAll();});
+		m = menuBar()->addMenu(tr8("3DGS·메쉬"));
+		connect(m->addAction(tr8("현재 맵으로 3DGS·메쉬 만들기...")), &QAction::triggered, this, [this]{makeGaussians();});
+		connect(m->addAction(tr8("만들기 중단")), &QAction::triggered, this, [this]{
+			if(gsProc_) {log(tr8("3DGS·메쉬 만들기를 중단합니다."), 1); killTree(gsProc_);}
+		});
+		m->addSeparator();
+		connect(m->addAction(tr8("메쉬 열기 (PLY)...")), &QAction::triggered, this, [this]{
+			QString f = QFileDialog::getOpenFileName(this, tr8("메쉬 열기"), gsResult("colmap/2dgs/mesh_hybrid.ply"), tr8("메쉬 (*.ply)"));
+			if(!f.isEmpty()) loadMesh(QDir::toNativeSeparators(f));
+		});
+		connect(m->addAction(tr8("3DGS 보기 (웹 브라우저)...")), &QAction::triggered, this, [this]{
+			QString f = QFileDialog::getOpenFileName(this, tr8("3DGS 모델 (point_cloud.ply)"), gsResult("colmap_x8/3dgs/point_cloud.ply"), tr8("3DGS (*.ply)"));
+			if(!f.isEmpty()) openSplats(QDir::toNativeSeparators(f));
+		});
+	}
+
+	// ------------------------------------------------ 3DGS / mesh
+
+	// results of mesh_3dgs.ps1 for the current map: <map folder>/<map name>_3dgs
+	QString gsDir(const QString & map) const
+	{
+		QFileInfo fi(map);
+		return QDir::toNativeSeparators(fi.dir().absoluteFilePath(fi.completeBaseName() + "_3dgs"));
+	}
+
+	QString gsResult(const QString & file) const
+	{
+		QString dir = locMap_->text().isEmpty()?outDir_->text():gsDir(locMap_->text());
+		QString path = QDir(dir).absoluteFilePath(file);
+		return QFileInfo(path).exists()?QDir::toNativeSeparators(path):dir;
+	}
+
+	static QString toolsDir()
+	{
+		QString tools = qEnvironmentVariable("RTABMAP_TOOLS");
+		return QDir(tools).exists("GaussianSplatting")?tools:QString();
+	}
+
+	// environment of the Gaussian tools: without the PYTHONPATH / PYTHONHOME of rtabmap_env.bat,
+	// which point to RTAB-Map's Python (another version) and break the imports of .gs_env
+	static QProcessEnvironment gsEnvironment()
+	{
+		QProcessEnvironment env = QProcessEnvironment::systemEnvironment();
+		env.remove("PYTHONPATH");
+		env.remove("PYTHONHOME");
+		return env;
+	}
+
+	// stops a process and its children (mesh_3dgs.ps1 -> python)
+	static void killTree(QProcess * & p)
+	{
+		if(!p)
+		{
+			return;
+		}
+#ifdef _WIN32
+		QProcess::execute("taskkill", QStringList() << "/T" << "/F" << "/PID" << QString::number(p->processId()));
+#endif
+		p->kill();
+		p->waitForFinished(3000);
+		p = 0; // deleted by its finished handler (deleteLater)
+	}
+
+	void makeGaussians()
+	{
+		if(gsProc_)
+		{
+			QMessageBox::information(this, tr8("3DGS·메쉬"), tr8("이미 만들고 있습니다 (로그 참고)."));
+			return;
+		}
+		if(engine_.running() || busy_)
+		{
+			QMessageBox::information(this, tr8("실행 중"), tr8("먼저 정지하세요."));
+			return;
+		}
+		QString tools = toolsDir();
+		if(tools.isEmpty())
+		{
+			QMessageBox::warning(this, tr8("3DGS·메쉬"), tr8("tools\\GaussianSplatting을 찾을 수 없습니다: live_viewer.bat (rtabmap_env.bat)로 실행하세요."));
+			return;
+		}
+		QString map = locMap_->text();
+		if(!QFileInfo(map).isFile())
+		{
+			map = QFileDialog::getOpenFileName(this, tr8("3DGS·메쉬를 만들 맵"), outDir_->text(), "RTAB-Map (*.db)");
+			if(map.isEmpty()) return;
+			map = QDir::toNativeSeparators(map);
+		}
+		// the color images and stereo pairs come from the recording the map was made from
+		QString euroc = findEuroc(recPath_->text());
+		if(euroc.isEmpty() || !QDir(euroc).exists("mav0/rgb"))
+		{
+			QMessageBox::information(this, tr8("3DGS·메쉬"),
+					tr8("이 맵을 만든 녹화(컬러 포함 EuRoC 폴더, euroc_rgb)를 선택하세요.\n"
+					    "카메라 실시간 매핑으로 만든 맵은 녹화가 없어 쓸 수 없습니다: 녹화한 뒤 녹화 파일로 매핑하세요."));
+			QString d = QFileDialog::getExistingDirectory(this, tr8("녹화 (euroc_rgb 폴더)"), recPath_->text());
+			if(d.isEmpty()) return;
+			euroc = findEuroc(d);
+			if(euroc.isEmpty() || !QDir(euroc).exists("mav0/rgb"))
+			{
+				log(tr8("컬러 스트림이 있는 EuRoC 폴더가 아닙니다: %1 (realsense_bag_to_euroc.py --rgb로 변환)").arg(d), 2);
+				return;
+			}
+		}
+		QString out = gsDir(map);
+		if(QMessageBox::question(this, tr8("3DGS·메쉬 만들기"),
+				tr8("맵: %1\n녹화: %2\n결과: %3\n\nGPU로 약 50분 걸립니다 (백그라운드). 시작할까요?").arg(map, euroc, out)) != QMessageBox::Yes)
+		{
+			return;
+		}
+		QDir install(QCoreApplication::applicationDirPath());
+		install.cdUp();
+		QStringList args;
+		args << "-NoProfile" << "-ExecutionPolicy" << "Bypass" << "-File" << QDir(tools).absoluteFilePath("GaussianSplatting/mesh_3dgs.ps1")
+		     << "-Euroc" << euroc << "-Map" << map << "-Out" << out << "-Install" << QDir::toNativeSeparators(install.absolutePath());
+		log(tr8("3DGS·메쉬 만들기 시작: %1").arg(out));
+		gsProc_ = new QProcess(this);
+		gsProc_->setProcessEnvironment(gsEnvironment());
+		gsProc_->setProcessChannelMode(QProcess::MergedChannels);
+		QProcess * proc = gsProc_;
+		connect(proc, &QProcess::readyReadStandardOutput, this, [this, proc]{
+			for(const QString & l : QString::fromLocal8Bit(proc->readAllStandardOutput()).split('\n', Qt::SkipEmptyParts))
+			{
+				QString line = l.trimmed();
+				if(line.isEmpty()) continue;
+				log("[3DGS] " + line);
+				if(line.startsWith("[") && line.contains("/7 "))
+				{
+					// step lines of mesh_3dgs.ps1: "[00:12:34] 3/7 2DGS training ..."
+					gsStep_ = line;
+					if(!engine_.running() && !busy_) setState(tr8("3DGS·메쉬: ") + line.mid(line.indexOf(']') + 2, 40), "#6a3d9a");
+				}
+			}
+		});
+		connect(proc, QOverload<int, QProcess::ExitStatus>::of(&QProcess::finished), this, [this, proc, out](int code, QProcess::ExitStatus status){
+			proc->deleteLater();
+			if(gsProc_ == proc) gsProc_ = 0;
+			QString mesh = QDir(out).absoluteFilePath("colmap/2dgs/mesh_hybrid.ply");
+			if(code == 0 && status == QProcess::NormalExit && QFileInfo(mesh).isFile())
+			{
+				log(tr8("3DGS·메쉬 완료: %1").arg(out));
+				if(!engine_.running() && !busy_) standby(tr8("3DGS·메쉬 완료"));
+				loadMesh(QDir::toNativeSeparators(mesh));
+				log(tr8("3DGS 모델: 3DGS·메쉬 > 3DGS 보기 (%1)").arg(QDir::toNativeSeparators(QDir(out).absoluteFilePath("colmap_x8/3dgs/point_cloud.ply"))));
+			}
+			else
+			{
+				log(tr8("3DGS·메쉬 만들기 실패 또는 중단 (코드 %1, %2)").arg(code).arg(gsStep_), 2);
+				if(!engine_.running() && !busy_) standby(tr8("3DGS·메쉬 실패"), "#a33");
+			}
+		});
+		gsStep_.clear();
+		gsProc_->start("powershell", args);
+	}
+
+	void loadMesh(const QString & path)
+	{
+		QApplication::setOverrideCursor(Qt::WaitCursor);
+		pcl::PolygonMesh::Ptr mesh(new pcl::PolygonMesh);
+		bool ok = pcl::io::loadPLYFile(path.toStdString(), *mesh) >= 0 && !mesh->polygons.empty();
+		viewer_->removeCloud("mesh");
+		if(ok)
+		{
+			// meshes of extract_mesh.py are in the map frame
+			ok = viewer_->addCloudMesh("mesh", mesh);
+		}
+		QApplication::restoreOverrideCursor();
+		if(!ok)
+		{
+			log(tr8("메쉬를 열 수 없습니다: %1").arg(path), 2);
+			return;
+		}
+		log(tr8("메쉬: %1 (삼각형 %2개)").arg(path).arg(QLocale().toString((qlonglong)mesh->polygons.size())));
+		showMesh_->setEnabled(true);
+		showMesh_->blockSignals(true);
+		showMesh_->setChecked(true);
+		showMesh_->blockSignals(false);
+		// the mesh hides the point clouds
+		showClouds_->setChecked(false);
+		viewer_->refreshView();
+	}
+
+	void openSplats(const QString & ply)
+	{
+		QString tools = toolsDir();
+		if(tools.isEmpty())
+		{
+			QMessageBox::warning(this, tr8("3DGS 보기"), tr8("tools\\GaussianSplatting을 찾을 수 없습니다: live_viewer.bat (rtabmap_env.bat)로 실행하세요."));
+			return;
+		}
+		killTree(splatProc_);
+		// Python environment of the Gaussian tools (train_3dgs.ps1), with viser
+		QString python = QDir(tools).absoluteFilePath("GaussianSplatting/.gs_env/Scripts/python.exe");
+		if(!QFileInfo(python).isFile()) python = "python";
+		QStringList args;
+		args << QDir(tools).absoluteFilePath("GaussianSplatting/view_3dgs.py") << ply;
+		// mesh of the same result folder, as a layer that can be shown in the browser
+		QDir result = QFileInfo(ply).dir();
+		result.cdUp();
+		result.cdUp();
+		QString mesh = result.absoluteFilePath("colmap/2dgs/mesh_hybrid.ply");
+		if(QFileInfo(mesh).isFile()) args << "--mesh" << mesh;
+		log(tr8("3DGS 보기: %1 -> 웹 브라우저 http://localhost:8080").arg(ply));
+		splatProc_ = new QProcess(this);
+		splatProc_->setProcessEnvironment(gsEnvironment());
+		splatProc_->setProcessChannelMode(QProcess::MergedChannels);
+		QProcess * proc = splatProc_;
+		connect(proc, &QProcess::readyReadStandardOutput, this, [this, proc]{
+			for(const QString & l : QString::fromLocal8Bit(proc->readAllStandardOutput()).split('\n', Qt::SkipEmptyParts))
+			{
+				if(l.contains("Gaussians") || l.contains("rror")) log("[3DGS] " + l.trimmed());
+			}
+		});
+		connect(proc, QOverload<int, QProcess::ExitStatus>::of(&QProcess::finished), this, [this, proc](int code, QProcess::ExitStatus){
+			proc->deleteLater();
+			if(splatProc_ == proc) splatProc_ = 0;
+			if(code != 0) log(tr8("3DGS 보기가 종료되었습니다 (코드 %1): viser 설치 확인 (pip install viser)").arg(code), 1);
+		});
+		splatProc_->start(python, args);
 	}
 
 	static QString defaultMapsDir()
@@ -1440,7 +1704,9 @@ private:
 
 	void clearAll()
 	{
-		viewer_->removeAllClouds();
+		viewer_->removeAllClouds(); // and the mesh
+		showMesh_->setEnabled(false);
+		showMesh_->setChecked(false);
 		viewer_->removeAllGraphs();
 		viewer_->removeAllLines();
 		viewer_->removeAllSpheres();
@@ -1730,18 +1996,23 @@ private:
 		s.db = path.toStdString();
 		s.cloud = cloudParams();
 		if(worker_.joinable()) worker_.join();
-		worker_ = std::thread([this, s]{
+		worker_ = std::thread([this, s, path]{
 			std::string error;
 			bool ok = false;
 			try {ok = engine_.view(s, error);}
 			catch(const std::exception & e) {error = e.what();}
-			gui([this, ok, error]{
+			gui([this, ok, error, path]{
 				busy_ = false;
 				setRunning(false);
 				mode_ = -1;
 				if(ok)
 				{
 					standby(tr8("맵 보기: 키프레임 %1개").arg(poses_.size()));
+					QString mesh = QDir(gsDir(path)).absoluteFilePath("colmap/2dgs/mesh_hybrid.ply");
+					if(QFileInfo(mesh).isFile())
+					{
+						log(tr8("이 맵의 메쉬와 3DGS가 있습니다: 3DGS·메쉬 > 메쉬 열기 / 3DGS 보기 (%1)").arg(gsDir(path)));
+					}
 					fitView();
 				}
 				else
@@ -2100,6 +2371,10 @@ private:
 	bool exitWhenDone_ = false;
 	QStringList autoArgs_;
 	QProcess * convert_ = 0;
+	QProcess * gsProc_ = 0;    // mesh_3dgs.ps1
+	QProcess * splatProc_ = 0; // view_3dgs.py
+	QString gsStep_;
+	QString mesh_, splats_; // --mesh, --splats
 
 	CloudViewer * viewer_;
 	QRadioButton * srcCamera_;
@@ -2122,6 +2397,7 @@ private:
 	QSpinBox * pointSize_;
 	QCheckBox * follow_;
 	QCheckBox * showClouds_;
+	QCheckBox * showMesh_;
 	QLabel * image_;
 	QLabel * state_;
 	std::map<std::string, QLabel*> stats_;
@@ -2153,7 +2429,7 @@ int main(int argc, char * argv[])
 	{
 		if(strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0)
 		{
-			printf("rtabmap-live_viewer [--open MAP.db]\n"
+			printf("rtabmap-live_viewer [--open MAP.db] [--mesh MESH.ply] [--splats 3DGS.ply]\n"
 				   "  [--auto map|loc|view --source realsense|RECORDING --db OUT_DIR_OR_MAP [--rate F] [--features orb|aliked] [--screenshot OUT.png] [--exit]]\n"
 				   "Real-time mapping and localization with a D435i (IR stereo + IMU) or a recording,\n"
 				   "and offline map viewing. --auto starts one module, the viewer then waits\n"

@@ -9,6 +9,10 @@ VIO (`--Odom/Strategy 15`, stereo IR + IMU), with or without ALIKED/LightGlue.
 
 - Stereo Module: **Infrared 1 and Infrared 2**, Y8, same resolution (e.g. 640x480 or 848x480) and 30 fps.
 - Stereo Module > Controls: **Emitter Enabled = Off** (the dot pattern breaks the tracking).
+  For dense depth (3DGS meshes), use **Emitter On Off** instead (emitter on every other
+  frame) and convert with `--emitter-split`: the frames without the dots feed the VIO
+  (half the frame rate), the frames with them the stereo depth of
+  `rtabmap_to_colmap.py --euroc`.
 - Motion Module: Accel and Gyro on, highest rates.
 - RGB Camera (optional, for COLMAP / 3DGS).
 - Hold the camera **still for 2-3 s** at the start (VIO static initialization),

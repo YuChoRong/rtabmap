@@ -16,6 +16,13 @@ Written:
   out_dir/mav0/imu0/data.csv, imu0/sensor.yaml        (gyro rate, accel interpolated)
   out_dir/mav0/rgb/data/<ns>.png, rgb/sensor.yaml     (with --rgb)
 
+Emitter On Off (RealSense Viewer: Stereo Module > Controls > Emitter On Off): the
+emitter is on every other frame. With --emitter-split, the frames without the dot
+pattern go to cam0/cam1 (VIO, half the frame rate) and the frames with it to
+cam0_emitter/cam1_emitter (dense stereo depth for rtabmap_to_colmap.py --euroc).
+The frames are told apart by their high-frequency energy (the dot pattern) compared
+with their two neighbors.
+
 Frames: librealsense gives IMU samples and extrinsics in camera axes (x right,
 y down, z forward). rtabmap-euroc_dataset assumes the EuRoC IMU axes (x up,
 y right, z forward), so IMU samples and camera poses are rotated into those
@@ -133,6 +140,7 @@ def main():
     parser.add_argument('output')
     parser.add_argument('--rgb', action='store_true', help='Also export the color stream (for COLMAP/3DGS)')
     parser.add_argument('--max-dt', type=float, default=0.002, help='Max left/right stamp difference (s)')
+    parser.add_argument('--emitter-split', action='store_true', help='Emitter On Off recording: frames with the dot pattern to cam0_emitter/cam1_emitter')
     args = parser.parse_args()
 
     out = Path(args.output) / 'mav0'
@@ -215,33 +223,55 @@ def main():
                 yield stamp_ns(m.header), m
         right = {s: m for s, m in stamps_and_msgs(ir2)}
         right_stamps = np.array(sorted(right))
-        for d in ('cam0/data', 'cam1/data', 'imu0'):
-            (out / d).mkdir(parents=True, exist_ok=True)
-        n, first_stamp, last_stamp = 0, None, None
-        with open(out / 'cam0/data.csv', 'w') as f0, open(out / 'cam1/data.csv', 'w') as f1:
-            f0.write('#timestamp [ns],filename\n'); f1.write('#timestamp [ns],filename\n')
-            for s, m in stamps_and_msgs(ir1):
-                i = np.searchsorted(right_stamps, s)
-                cand = [right_stamps[j] for j in (i - 1, i) if 0 <= j < len(right_stamps)]
-                if not cand:
-                    continue
-                r = min(cand, key=lambda x: abs(int(x) - s))
-                if abs(int(r) - s) > args.max_dt * 1e9:
-                    continue
-                name = '%d.png' % s
-                cv2.imwrite(str(out / 'cam0/data' / name), image_to_numpy(m))
-                cv2.imwrite(str(out / 'cam1/data' / name), image_to_numpy(right[r]))
-                f0.write('%d,%s\n' % (s, name)); f1.write('%d,%s\n' % (s, name))
-                first_stamp = s if first_stamp is None else first_stamp
-                last_stamp = s
-                n += 1
-        if n < 2:
+        (out / 'imu0').mkdir(parents=True, exist_ok=True)
+        pairs = []  # (stamp, left image, right image, dot pattern energy)
+        for s, m in stamps_and_msgs(ir1):
+            i = np.searchsorted(right_stamps, s)
+            cand = [right_stamps[j] for j in (i - 1, i) if 0 <= j < len(right_stamps)]
+            if not cand:
+                continue
+            r = min(cand, key=lambda x: abs(int(x) - s))
+            if abs(int(r) - s) > args.max_dt * 1e9:
+                continue
+            left = image_to_numpy(m)
+            energy = float(np.abs(left.astype(np.float32) - cv2.GaussianBlur(left, (0, 0), 1.5)).mean()) if args.emitter_split else 0.0
+            pairs.append((s, left, image_to_numpy(right[r]), energy))
+        if len(pairs) < 2:
             sys.exit('No synchronized Infrared 1 / Infrared 2 pairs found')
+
+        groups = {'': pairs}
+        if args.emitter_split:
+            # Consecutive frames see nearly the same scene: a frame with the dots has more
+            # high-frequency energy than the mean of its two neighbors
+            e = np.array([p[3] for p in pairs])
+            padded = np.pad(e, 1, mode='edge')
+            on = e > (padded[:-2] + padded[2:]) / 2
+            alternating = np.mean(on[1:] != on[:-1])
+            print('Emitter split: %d frames with the dot pattern, %d without (energy %.2f / %.2f), %.0f%% alternate'
+                  % (on.sum(), (~on).sum(), np.median(e[on]) if on.any() else 0, np.median(e[~on]) if (~on).any() else 0,
+                     100 * alternating))
+            if alternating < 0.8:
+                print('Warning: the frames do not alternate, was Emitter On Off enabled in the recording?')
+            groups = {'': [p for p, o in zip(pairs, on) if not o], '_emitter': [p for p, o in zip(pairs, on) if o]}
+
+        for suffix, group in groups.items():
+            for d in ('cam0%s/data' % suffix, 'cam1%s/data' % suffix):
+                (out / d).mkdir(parents=True, exist_ok=True)
+            with open(out / ('cam0%s/data.csv' % suffix), 'w') as f0, open(out / ('cam1%s/data.csv' % suffix), 'w') as f1:
+                f0.write('#timestamp [ns],filename\n'); f1.write('#timestamp [ns],filename\n')
+                for s, left, right_img, _ in group:
+                    name = '%d.png' % s
+                    cv2.imwrite(str(out / ('cam0%s/data' % suffix) / name), left)
+                    cv2.imwrite(str(out / ('cam1%s/data' % suffix) / name), right_img)
+                    f0.write('%d,%s\n' % (s, name)); f1.write('%d,%s\n' % (s, name))
+        vio = groups['']
+        n, first_stamp, last_stamp = len(vio), vio[0][0], vio[-1][0]
         rate = (n - 1) / ((last_stamp - first_stamp) * 1e-9)
         K1, D1, size1 = info(ir1)
         K2, D2, size2 = info(ir2)
-        write_camera_yaml(out / 'cam0/sensor.yaml', K1, D1, size1, rate, T_BS(T_ir1))
-        write_camera_yaml(out / 'cam1/sensor.yaml', K2, D2, size2, rate, T_BS(T_ir2))
+        for suffix in groups:
+            write_camera_yaml(out / ('cam0%s/sensor.yaml' % suffix), K1, D1, size1, rate, T_BS(T_ir1))
+            write_camera_yaml(out / ('cam1%s/sensor.yaml' % suffix), K2, D2, size2, rate, T_BS(T_ir2))
         print('%d stereo pairs, %.1f Hz, %dx%d, fx=%.1f' % (n, rate, size1[0], size1[1], K1[0, 0]))
 
         # IMU: gyro timestamps, accel linearly interpolated, rotated to EuRoC-like axes

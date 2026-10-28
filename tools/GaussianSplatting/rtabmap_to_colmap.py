@@ -13,7 +13,26 @@ stereo point cloud, then writes:
   OUT/gt_camera_poses.txt       ground truth camera poses (stamp x y z qx qy qz qw id)
   OUT/camera_poses.txt          estimated camera poses, same format
 
-Usage: rtabmap_to_colmap.py map.db OUT [--rtabmap-export PATH] [--voxel 0.02] [--max-points 200000]
+With --euroc DIR (the EuRoC-layout recording the map was made from, with the
+D435i color stream in mav0/rgb, see realsense_bag_to_euroc.py --rgb), the color
+images are exported instead of the infrared ones, and depth maps are added:
+
+  OUT/images/<id>.jpg           color image nearest to each keyframe; its pose is the
+                                keyframe pose interpolated at the color stamp, moved to
+                                the color camera with the T_BS extrinsics of sensor.yaml
+  OUT/depths/<id>.png           16-bit depth (mm) in the color camera, from the infrared
+                                stereo pair of the keyframe (OpenCV SGBM), 0 = unknown; from the
+                                nearest pair with the emitter on when mav0/cam0_emitter exists
+  OUT/sparse/0/points3D.txt     colored points back-projected from the depth maps
+  OUT/frames.txt                name, stamp and keyframe flag (1) of each image
+
+--extra-rate HZ adds color images between the keyframes (the sharpest one in each
+1/HZ s slot, pose interpolated between the keyframes, depth from its own infrared
+pair): more views for the Gaussians. Their names start with x, so train_gsplat.py
+still holds out the same keyframe images for evaluation (and also leaves out the
+extra images next to them).
+
+Usage: rtabmap_to_colmap.py map.db OUT [--euroc DIR] [--rtabmap-export PATH] [--voxel 0.02] [--max-points 200000]
 """
 import argparse, math, os, random, re, shutil, struct, subprocess, sys, tempfile
 
@@ -122,6 +141,211 @@ def read_ply_vertices(path):
     return points
 
 
+def read_euroc_camera(folder):
+    """EuRoC sensor.yaml + data.csv: (K 3x3, (width, height), T_BS 4x4 camera -> body, [(stamp s, path)])."""
+    import numpy as np
+    text = open(os.path.join(folder, 'sensor.yaml')).read()
+    t_bs = [float(x) for x in re.search(r'T_BS:.*?data:\s*\[([^\]]*)\]', text, re.S).group(1).split(',')]
+    fx, fy, cx, cy = [float(x) for x in re.search(r'intrinsics:\s*\[([^\]]*)\]', text).group(1).split(',')]
+    w, h = [int(x) for x in re.search(r'resolution:\s*\[([^\]]*)\]', text).group(1).split(',')]
+    frames = []
+    for line in open(os.path.join(folder, 'data.csv')):
+        if line.startswith('#') or not line.strip():
+            continue
+        stamp, name = line.strip().split(',')[:2]
+        frames.append((int(stamp) * 1e-9, os.path.join(folder, 'data', name.strip())))
+    frames.sort()
+    return (np.array([[fx, 0, cx], [0, fy, cy], [0, 0, 1]]), (w, h),
+            np.array(t_bs).reshape(4, 4), frames)
+
+
+def to_matrix(R, t):
+    import numpy as np
+    T = np.eye(4)
+    T[:3, :3] = np.array(R)
+    T[:3, 3] = t
+    return T
+
+
+def interpolate_pose(stamps, poses, t):
+    """Pose at time t, linear in translation and slerp in rotation between the two nearest stamps."""
+    import numpy as np
+    i = int(np.clip(np.searchsorted(stamps, t), 1, len(stamps) - 1))
+    t0, t1 = stamps[i-1], stamps[i]
+    a = 0.0 if t1 <= t0 else float(np.clip((t - t0) / (t1 - t0), -0.5, 1.5))
+    A, B = poses[i-1], poses[i]
+    dR = A[:3, :3].T @ B[:3, :3]
+    angle = math.acos(max(-1.0, min(1.0, (np.trace(dR) - 1) / 2)))
+    if angle < 1e-9:
+        R = A[:3, :3]
+    else:
+        axis = np.array([dR[2, 1] - dR[1, 2], dR[0, 2] - dR[2, 0], dR[1, 0] - dR[0, 1]]) / (2 * math.sin(angle))
+        k = np.array([[0, -axis[2], axis[1]], [axis[2], 0, -axis[0]], [-axis[1], axis[0], 0]])
+        th = a * angle
+        R = A[:3, :3] @ (np.eye(3) + math.sin(th) * k + (1 - math.cos(th)) * k @ k)
+    return to_matrix(R, (1 - a) * A[:3, 3] + a * B[:3, 3])
+
+
+def stereo_depth(left, right, fx, baseline, max_depth):
+    """Depth (m) of the rectified left infrared image, 0 where unknown."""
+    import cv2
+    import numpy as np
+    block = 5
+    sgbm = cv2.StereoSGBM_create(minDisparity=0, numDisparities=128, blockSize=block,
+                                 P1=8 * block * block, P2=32 * block * block, disp12MaxDiff=1,
+                                 uniquenessRatio=10, speckleWindowSize=100, speckleRange=2,
+                                 mode=cv2.STEREO_SGBM_MODE_SGBM_3WAY)
+    disp = sgbm.compute(left, right).astype(np.float32) / 16.0
+    depth = np.zeros_like(disp)
+    valid = disp > 1.0
+    depth[valid] = fx * baseline / disp[valid]
+    depth[depth > max_depth] = 0
+    return depth
+
+
+def project_depth(depth_ir, K_ir, T_rgb_ir, K_rgb, size_rgb):
+    """Moves an infrared depth map to the color camera (z-buffer; each pixel covers the area of an
+    infrared pixel in the color image, which has about twice the resolution on the D435i)."""
+    import numpy as np
+    h, w = depth_ir.shape
+    v, u = np.nonzero(depth_ir)
+    z = depth_ir[v, u]
+    pts = np.stack([(u - K_ir[0, 2]) * z / K_ir[0, 0], (v - K_ir[1, 2]) * z / K_ir[1, 1], z], 1)
+    pts = pts @ T_rgb_ir[:3, :3].T + T_rgb_ir[:3, 3]
+    pts = pts[pts[:, 2] > 0.05]
+    W, H = size_rgb
+    out = np.full((H, W), np.inf, np.float32)
+    x = pts[:, 0] / pts[:, 2] * K_rgb[0, 0] + K_rgb[0, 2]
+    y = pts[:, 1] / pts[:, 2] * K_rgb[1, 1] + K_rgb[1, 2]
+    size = max(1, int(math.ceil(K_rgb[0, 0] / K_ir[0, 0])))
+    for dx in range(size):
+        for dy in range(size):
+            xi = np.floor(x - (size - 1) / 2.0).astype(int) + dx
+            yi = np.floor(y - (size - 1) / 2.0).astype(int) + dy
+            ok = (xi >= 0) & (xi < W) & (yi >= 0) & (yi < H)
+            np.minimum.at(out, (yi[ok], xi[ok]), pts[ok, 2])
+    out[np.isinf(out)] = 0
+    return out
+
+
+EXTRA_ID = 1000000  # image ids of the extra images (keyframe images keep their node id)
+
+
+def export_euroc_color(args, cameras, out_images, out_depths):
+    """Color images, their poses and depth maps from the EuRoC recording. Returns (names, poses, K, size, points)."""
+    import cv2
+    import numpy as np
+    mav = os.path.join(args.euroc, 'mav0') if os.path.isdir(os.path.join(args.euroc, 'mav0')) else args.euroc
+    if not os.path.isdir(os.path.join(mav, 'rgb')):
+        sys.exit('No color stream in %s (convert the recording with realsense_bag_to_euroc.py --rgb)' % mav)
+    K_rgb, size_rgb, T_b_rgb, rgb_frames = read_euroc_camera(os.path.join(mav, 'rgb'))
+    # Emitter On Off recordings (realsense_bag_to_euroc.py --emitter-split): depth from the
+    # frames with the dot pattern, which are not the keyframes' frames
+    emitter = os.path.isdir(os.path.join(mav, 'cam0_emitter'))
+    suffix = '_emitter' if emitter else ''
+    K_ir, _, T_b_c0, left_frames = read_euroc_camera(os.path.join(mav, 'cam0' + suffix))
+    _, _, T_b_c1, right_frames = read_euroc_camera(os.path.join(mav, 'cam1' + suffix))
+    if emitter:
+        print('Depth from the infrared frames with the emitter on (cam0_emitter, cam1_emitter)')
+    baseline = float(np.linalg.norm((np.linalg.inv(T_b_c0) @ T_b_c1)[:3, 3]))
+    T_c0_rgb = np.linalg.inv(T_b_c0) @ T_b_rgb
+
+    ids = sorted(cameras, key=lambda i: cameras[i][0])
+    kf_stamps = np.array([cameras[i][0] for i in ids])
+    kf_poses = [to_matrix(cameras[i][1], cameras[i][2]) for i in ids]
+    rgb_stamps = np.array([f[0] for f in rgb_frames])
+    left_stamps = np.array([f[0] for f in left_frames])
+    right_by_stamp = {round(f[0], 4): f[1] for f in right_frames}
+
+    def depth_at(stamp, T_w_rgb):
+        """Depth of the infrared pair nearest to stamp, moved to the color camera (None if no pair)."""
+        li = int(np.argmin(np.abs(left_stamps - stamp)))
+        right_path = right_by_stamp.get(round(left_stamps[li], 4))
+        if abs(left_stamps[li] - stamp) > (0.04 if emitter else 0.02) or right_path is None:
+            return None
+        left = cv2.imread(left_frames[li][1], cv2.IMREAD_GRAYSCALE)
+        right = cv2.imread(right_path, cv2.IMREAD_GRAYSCALE)
+        if left is None or right is None:
+            return None
+        depth_ir = stereo_depth(left, right, K_ir[0, 0], baseline, args.max_depth)
+        T_rgb_ir = np.linalg.inv(T_w_rgb) @ interpolate_pose(kf_stamps, kf_poses, left_stamps[li])
+        return project_depth(depth_ir, K_ir, T_rgb_ir, K_rgb, size_rgb)
+
+    def save(i, name, j, img, T_w_rgb, depth):
+        cv2.imwrite(os.path.join(out_images, name), img, [cv2.IMWRITE_JPEG_QUALITY, 95])
+        names[i] = name
+        poses[i] = (rgb_stamps[j], T_w_rgb[:3, :3].tolist(), T_w_rgb[:3, 3].tolist())
+        if depth is not None:
+            cv2.imwrite(os.path.join(out_depths, os.path.splitext(name)[0] + '.png'), np.round(depth * 1000).astype(np.uint16))
+
+    names, poses, points, colors = {}, {}, [], []
+    keyframe_rgb = set()
+    rng = np.random.default_rng(0)
+    for k, i in enumerate(ids):
+        stamp = kf_stamps[k]
+        j = int(np.argmin(np.abs(rgb_stamps - stamp)))
+        if abs(rgb_stamps[j] - stamp) > args.max_dt:
+            print('Keyframe %d: no color image within %.0f ms, skipped' % (i, args.max_dt * 1000))
+            continue
+        T_w_rgb = interpolate_pose(kf_stamps, kf_poses, rgb_stamps[j]) @ T_c0_rgb
+        img = cv2.imread(rgb_frames[j][1], cv2.IMREAD_COLOR)
+        if img is None:
+            print('Cannot read %s, skipped' % rgb_frames[j][1])
+            continue
+        # Depth of the keyframe's infrared pair, moved to the color camera at the color stamp
+        depth = depth_at(stamp, T_w_rgb)
+        save(i, '%d.jpg' % i, j, img, T_w_rgb, depth)
+        keyframe_rgb.add(j)
+        if depth is None:
+            continue
+
+        # Colored initial points from a random subset of the depth pixels
+        v, u = np.nonzero(depth)
+        if len(v) == 0:
+            continue
+        sel = rng.choice(len(v), min(len(v), 20000), replace=False)
+        v, u = v[sel], u[sel]
+        z = depth[v, u]
+        pc = np.stack([(u - K_rgb[0, 2]) * z / K_rgb[0, 0], (v - K_rgb[1, 2]) * z / K_rgb[1, 1], z], 1)
+        points.append(pc @ T_w_rgb[:3, :3].T + T_w_rgb[:3, 3])
+        colors.append(img[v, u, ::-1])
+        if k % 20 == 0:
+            print('%d/%d keyframes, %.0f%% of the color pixels with depth' % (k + 1, len(ids), 100.0 * np.count_nonzero(depth) / depth.size))
+
+    if args.extra_rate > 0:
+        # Sharpest color image (variance of the Laplacian) of each 1/rate slot between the keyframes
+        slot = np.floor((rgb_stamps - kf_stamps[0]) * args.extra_rate).astype(int)
+        inside = (rgb_stamps > kf_stamps[0]) & (rgb_stamps < kf_stamps[-1])
+        kf_slots = {slot[j] for j in keyframe_rgb}
+        best = {}
+        for j in np.nonzero(inside)[0]:
+            if slot[j] in kf_slots:
+                continue
+            gray = cv2.imread(rgb_frames[j][1], cv2.IMREAD_GRAYSCALE)
+            if gray is None:
+                continue
+            sharp = cv2.Laplacian(cv2.resize(gray, None, fx=0.5, fy=0.5), cv2.CV_32F).var()
+            if slot[j] not in best or sharp > best[slot[j]][1]:
+                best[slot[j]] = (j, sharp)
+        for n, (j, _) in enumerate(sorted(best.values())):
+            T_w_rgb = interpolate_pose(kf_stamps, kf_poses, rgb_stamps[j]) @ T_c0_rgb
+            img = cv2.imread(rgb_frames[j][1], cv2.IMREAD_COLOR)
+            save(EXTRA_ID + n, 'x%05d.jpg' % n, j, img, T_w_rgb, depth_at(rgb_stamps[j], T_w_rgb))
+            if n % 50 == 0:
+                print('%d/%d extra images' % (n + 1, len(best)))
+        print('%d extra images between the keyframes (%.1f per second)' % (len(best), args.extra_rate))
+
+    pts = []
+    if points:
+        P = np.concatenate(points)
+        C = np.concatenate(colors)
+        # One point per voxel
+        keys = np.floor(P / args.voxel).astype(np.int64)
+        _, first = np.unique(keys, axis=0, return_index=True)
+        pts = [(p[0], p[1], p[2], c[0], c[1], c[2]) for p, c in zip(P[first].tolist(), C[first].tolist())]
+    return names, poses, K_rgb, size_rgb, pts
+
+
 def find_rtabmap_export():
     """rtabmap-export in PATH, else in the default install folders (Windows installer, /usr/local)."""
     found = shutil.which('rtabmap-export')
@@ -144,6 +368,10 @@ def main():
                         help='rtabmap-export executable (e.g., C:/Program Files/RTABMap/bin/rtabmap-export.exe)')
     parser.add_argument('--voxel', type=float, default=0.02, help='Voxel size (m) of the initial point cloud.')
     parser.add_argument('--max-points', type=int, default=200000, help='Random subset of the initial points (0 = all).')
+    parser.add_argument('--euroc', help='EuRoC-layout recording of the map with mav0/rgb: export color images and depth maps.')
+    parser.add_argument('--max-depth', type=float, default=4.0, help='Maximum stereo depth (m) with --euroc.')
+    parser.add_argument('--max-dt', type=float, default=0.02, help='Maximum time (s) between a keyframe and its color image with --euroc.')
+    parser.add_argument('--extra-rate', type=float, default=0, help='--euroc: color images added between the keyframes, per second (0 = keyframes only).')
     args = parser.parse_args()
 
     tmp = tempfile.mkdtemp(prefix='rtabmap_colmap_')
@@ -183,17 +411,25 @@ def main():
         os.makedirs(out_images, exist_ok=True)
         os.makedirs(out_sparse, exist_ok=True)
 
-        # Left image of a stereo camera, or color image of an RGB-D camera
-        image_dir = next((os.path.join(tmp, d) for d in ('map_left', 'map_rgb', 'map')
-                          if os.path.isdir(os.path.join(tmp, d))), None)
-        if image_dir is None:
-            sys.exit('No image exported from the database (were images saved in it?)')
-        names = {}
-        for fname in os.listdir(image_dir):
-            stem = os.path.splitext(fname)[0]
-            if stem.isdigit() and int(stem) in cameras:
-                shutil.copy(os.path.join(image_dir, fname), os.path.join(out_images, fname))
-                names[int(stem)] = fname
+        euroc_points = None
+        if args.euroc:
+            out_depths = os.path.join(args.output, 'depths')
+            os.makedirs(out_depths, exist_ok=True)
+            names, cameras, K, (width, height), euroc_points = export_euroc_color(args, cameras, out_images, out_depths)
+            fx, fy, cx, cy = K[0, 0], K[1, 1], K[0, 2], K[1, 2]
+            L = None  # ground truth stays in the infrared camera frame: not exported
+        else:
+            # Left image of a stereo camera, or color image of an RGB-D camera
+            image_dir = next((os.path.join(tmp, d) for d in ('map_left', 'map_rgb', 'map')
+                              if os.path.isdir(os.path.join(tmp, d))), None)
+            if image_dir is None:
+                sys.exit('No image exported from the database (were images saved in it?)')
+            names = {}
+            for fname in os.listdir(image_dir):
+                stem = os.path.splitext(fname)[0]
+                if stem.isdigit() and int(stem) in cameras:
+                    shutil.copy(os.path.join(image_dir, fname), os.path.join(out_images, fname))
+                    names[int(stem)] = fname
 
         with open(os.path.join(out_sparse, 'cameras.txt'), 'w') as f:
             f.write('# CAMERA_ID MODEL WIDTH HEIGHT PARAMS[]\n')
@@ -208,6 +444,10 @@ def main():
                 qw, qx, qy, qz = rot_to_quat(Rcw)
                 f.write('%d %.9f %.9f %.9f %.9f %.9f %.9f %.9f 1 %s\n\n' % (i, qw, qx, qy, qz, tcw[0], tcw[1], tcw[2], names[i]))
         write_poses(os.path.join(args.output, 'camera_poses.txt'), {i: cameras[i] for i in names})
+        with open(os.path.join(args.output, 'frames.txt'), 'w') as f:
+            f.write('# NAME STAMP KEYFRAME\n')
+            for i in sorted(names, key=lambda i: cameras[i][0]):
+                f.write('%s %.6f %d\n' % (names[i], cameras[i][0], 0 if i >= EXTRA_ID else 1))
 
         gt_path = os.path.join(tmp, 'map_gt_poses.txt')
         gt_count = 0
@@ -221,7 +461,7 @@ def main():
             write_poses(os.path.join(args.output, 'gt_camera_poses.txt'), gt)
             gt_count = len(gt)
 
-        points = read_ply_vertices(os.path.join(tmp, 'map_cloud.ply'))
+        points = euroc_points if euroc_points else read_ply_vertices(os.path.join(tmp, 'map_cloud.ply'))
         total = len(points)
         if args.max_points > 0 and len(points) > args.max_points:
             random.seed(0)
