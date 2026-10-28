@@ -1394,6 +1394,16 @@ private:
 		return QDir(tools).exists("GaussianSplatting")?tools:QString();
 	}
 
+	// environment of the Gaussian tools: without the PYTHONPATH / PYTHONHOME of rtabmap_env.bat,
+	// which point to RTAB-Map's Python (another version) and break the imports of .gs_env
+	static QProcessEnvironment gsEnvironment()
+	{
+		QProcessEnvironment env = QProcessEnvironment::systemEnvironment();
+		env.remove("PYTHONPATH");
+		env.remove("PYTHONHOME");
+		return env;
+	}
+
 	// stops a process and its children (mesh_3dgs.ps1 -> python)
 	static void killTree(QProcess * & p)
 	{
@@ -1463,6 +1473,7 @@ private:
 		     << "-Euroc" << euroc << "-Map" << map << "-Out" << out << "-Install" << QDir::toNativeSeparators(install.absolutePath());
 		log(tr8("3DGS·메쉬 만들기 시작: %1").arg(out));
 		gsProc_ = new QProcess(this);
+		gsProc_->setProcessEnvironment(gsEnvironment());
 		gsProc_->setProcessChannelMode(QProcess::MergedChannels);
 		QProcess * proc = gsProc_;
 		connect(proc, &QProcess::readyReadStandardOutput, this, [this, proc]{
@@ -1549,6 +1560,7 @@ private:
 		if(QFileInfo(mesh).isFile()) args << "--mesh" << mesh;
 		log(tr8("3DGS 보기: %1 -> 웹 브라우저 http://localhost:8080").arg(ply));
 		splatProc_ = new QProcess(this);
+		splatProc_->setProcessEnvironment(gsEnvironment());
 		splatProc_->setProcessChannelMode(QProcess::MergedChannels);
 		QProcess * proc = splatProc_;
 		connect(proc, &QProcess::readyReadStandardOutput, this, [this, proc]{

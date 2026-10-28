@@ -39,6 +39,9 @@ param(
 $ErrorActionPreference = "Stop"
 # Progress lines of the Python steps show up as they are printed, also when the output is piped
 $env:PYTHONUNBUFFERED = "1"
+# Started from rtabmap_env.bat (e.g. by rtabmap-live_viewer): its PYTHONPATH / PYTHONHOME point to
+# RTAB-Map's Python, another version than the Gaussian tools' environment
+Remove-Item Env:PYTHONPATH, Env:PYTHONHOME -ErrorAction SilentlyContinue
 # PowerShell 5: $PSScriptRoot is empty in param() defaults
 if (-not $Venv) { $Venv = Join-Path $PSScriptRoot ".gs_env" }
 if (-not $Euroc -and -not $Bag) { throw "Give -Euroc (converted recording) or -Bag (RealSense Viewer recording)" }
