@@ -149,6 +149,11 @@ python3 eval_mesh.py OUT/colmap OUT/colmap/2dgs/mesh.ply OUT/colmap/stereo_mesh.
   skips the extra images next to them. `--min-sharpness 0.5` leaves out blurred training
   images, `--strategy mcmc` / `--absgrad` / `--antialiased` are gsplat's densification and
   rasterization options, and LPIPS is reported when the `lpips` package (BSD-2) is installed.
+- Viewing: `view_3dgs.py MODEL\point_cloud.ply [--mesh mesh_hybrid.ply]` shows the model in the
+  web browser (viser, MIT; `pip install viser` in the `.gs_env` environment). In
+  `rtabmap-live_viewer`, the 3DGS·메쉬 menu runs `mesh_3dgs.ps1` for the open map and its
+  recording (results in `<map>_3dgs`), shows the mesh over the map, and opens the 3DGS model
+  in the browser.
 - `extract_mesh.py` renders the median depth of every training image and fuses it in
   an Open3D TSDF volume (`--voxel 0.02` m), then removes small pieces.
   `--method poisson` fits a screened Poisson surface (Open3D) to the rendered depth
